@@ -78,6 +78,58 @@ class TaskRepository:
             ).fetchall()
         return [Segment.from_row(row) for row in rows]
 
+    def get_task_duration_sec(self, task_id: int) -> float:
+        with self.database.session() as connection:
+            row = connection.execute(
+                "SELECT COALESCE(MAX(end_sec), 0) AS duration_sec FROM segments WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        return float(row["duration_sec"]) if row else 0.0
+
+    def list_segments_in_window(
+        self,
+        task_id: int,
+        window_start_sec: float,
+        window_end_sec: float,
+        include_labeled: bool = True,
+    ) -> list[Segment]:
+        query = """
+            SELECT * FROM segments
+            WHERE task_id = ?
+              AND end_sec > ?
+              AND start_sec < ?
+        """
+        params: list[object] = [task_id, window_start_sec, window_end_sec]
+        if not include_labeled:
+            query += " AND current_label IS NULL"
+        query += " ORDER BY start_sec"
+        with self.database.session() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [Segment.from_row(row) for row in rows]
+
+    def list_segments_by_threshold_in_window(
+        self,
+        task_id: int,
+        min_threshold: float,
+        max_threshold: float,
+        window_start_sec: float,
+        window_end_sec: float,
+    ) -> list[Segment]:
+        with self.database.session() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM segments
+                WHERE task_id = ?
+                  AND current_label IS NULL
+                  AND heat_score BETWEEN ? AND ?
+                  AND end_sec > ?
+                  AND start_sec < ?
+                ORDER BY heat_score DESC, start_sec ASC
+                """,
+                (task_id, min_threshold, max_threshold, window_start_sec, window_end_sec),
+            ).fetchall()
+        return [Segment.from_row(row) for row in rows]
+
     def update_segment_label(self, segment_id: int, label: Optional[str]) -> None:
         with self.database.session() as connection:
             connection.execute(

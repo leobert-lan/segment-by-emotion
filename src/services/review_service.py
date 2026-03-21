@@ -18,8 +18,35 @@ class ReviewService:
     def list_all_segments(self, task_id: int) -> list[Segment]:
         return self.task_repository.list_segments(task_id=task_id, include_labeled=True)
 
+    def get_task_duration_sec(self, task_id: int) -> float:
+        return self.task_repository.get_task_duration_sec(task_id)
+
+    def list_window_segments(self, task_id: int, window_start_sec: float, window_end_sec: float) -> list[Segment]:
+        return self.task_repository.list_segments_in_window(
+            task_id=task_id,
+            window_start_sec=window_start_sec,
+            window_end_sec=window_end_sec,
+            include_labeled=True,
+        )
+
     def list_candidates(self, task_id: int, min_threshold: float, max_threshold: float) -> list[Segment]:
         return self.task_repository.list_segments_by_threshold(task_id, min_threshold, max_threshold)
+
+    def list_window_candidates(
+        self,
+        task_id: int,
+        min_threshold: float,
+        max_threshold: float,
+        window_start_sec: float,
+        window_end_sec: float,
+    ) -> list[Segment]:
+        return self.task_repository.list_segments_by_threshold_in_window(
+            task_id=task_id,
+            min_threshold=min_threshold,
+            max_threshold=max_threshold,
+            window_start_sec=window_start_sec,
+            window_end_sec=window_end_sec,
+        )
 
     def mark_segment(self, task_id: int, segment_id: int, new_label: str) -> None:
         segment = self.task_repository.get_segment(segment_id)

@@ -24,14 +24,25 @@ class SmokeFlowTest(unittest.TestCase):
 
             task_repo = TaskRepository(database)
             profile_repo = SpeakerProfileRepository(database)
-            ingest = TaskIngestService(task_repo, HeatAnalyzer())
+            analyzer = HeatAnalyzer()
+            analyzer._try_load_audio = lambda _path: (None, None)  # type: ignore[method-assign]
+            ingest = TaskIngestService(task_repo, analyzer)
             review = ReviewService(task_repo, profile_repo)
 
             task = ingest.create_task_and_run_stage1(str(dummy_video), "speaker_alpha", segment_duration=5.0)
             self.assertEqual(task.status, "stage1_done")
 
+            duration = review.get_task_duration_sec(task.id)
+            self.assertGreater(duration, 0.0)
+
+            window_segments = review.list_window_segments(task.id, 0.0, 30.0)
+            self.assertGreater(len(window_segments), 0)
+
             candidates = review.list_candidates(task.id, 0.2, 1.0)
             self.assertGreater(len(candidates), 0)
+
+            window_candidates = review.list_window_candidates(task.id, 0.2, 1.0, 0.0, 30.0)
+            self.assertGreater(len(window_candidates), 0)
 
             first = candidates[0]
             review.mark_segment(task.id, first.id, "interesting")

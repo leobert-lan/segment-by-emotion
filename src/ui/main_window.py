@@ -1,4 +1,6 @@
 import tkinter as tk
+from queue import Empty, Queue
+from threading import Thread
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -28,6 +30,13 @@ class MainWindow(tk.Tk):
 
         self.video_path_var = tk.StringVar()
         self.speaker_id_var = tk.StringVar(value="speaker_001")
+        self.create_task_button: ttk.Button | None = None
+
+        self.loading_dialog: tk.Toplevel | None = None
+        self.loading_progress: ttk.Progressbar | None = None
+        self._create_task_thread: Thread | None = None
+        self._create_task_result_queue: Queue = Queue()
+        self._create_task_poll_after_id: str | None = None
 
         self.tasks_tree = ttk.Treeview(
             self,
@@ -47,6 +56,7 @@ class MainWindow(tk.Tk):
         notebook.add(self.review_page, text="Review")
 
         self.refresh_tasks()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _build_task_page(self) -> None:
         top = ttk.Frame(self.task_page)
@@ -59,7 +69,8 @@ class MainWindow(tk.Tk):
         ttk.Label(top, text="说话人ID").grid(row=1, column=0, sticky="w", pady=6)
         ttk.Entry(top, textvariable=self.speaker_id_var, width=20).grid(row=1, column=1, sticky="w", padx=6)
 
-        ttk.Button(top, text="创建任务并计算热度", command=self.create_task).grid(row=1, column=2, padx=4)
+        self.create_task_button = ttk.Button(top, text="创建任务并计算热度", command=self.create_task)
+        self.create_task_button.grid(row=1, column=2, padx=4)
         ttk.Button(top, text="刷新列表", command=self.refresh_tasks).grid(row=1, column=3, padx=4)
         ttk.Button(top, text="发送到第三阶段(Stub)", command=self.send_to_stage3).grid(row=1, column=4, padx=4)
 
@@ -87,6 +98,10 @@ class MainWindow(tk.Tk):
             self.video_path_var.set(path)
 
     def create_task(self) -> None:
+        if self._create_task_thread is not None and self._create_task_thread.is_alive():
+            messagebox.showinfo("任务进行中", "当前正在计算热度，请等待完成")
+            return
+
         video_path = self.video_path_var.get().strip()
         speaker_id = self.speaker_id_var.get().strip()
         if not video_path:
@@ -99,10 +114,79 @@ class MainWindow(tk.Tk):
             messagebox.showerror("文件不存在", video_path)
             return
 
-        task = self.ingest_service.create_task_and_run_stage1(video_path=video_path, speaker_id=speaker_id)
-        self.refresh_tasks()
-        self.review_page.refresh_tasks()
-        messagebox.showinfo("任务已创建", f"Task {task.id} 已完成阶段一分段与热度计算")
+        self._show_loading("正在提取音频并计算热度，请稍候...")
+        self._set_create_task_enabled(False)
+
+        def worker() -> None:
+            try:
+                task = self.ingest_service.create_task_and_run_stage1(video_path=video_path, speaker_id=speaker_id)
+                self._create_task_result_queue.put(("ok", task))
+            except Exception as exc:
+                self._create_task_result_queue.put(("error", exc))
+
+        self._create_task_thread = Thread(target=worker, daemon=True)
+        self._create_task_thread.start()
+        self._poll_create_task_result()
+
+    def _poll_create_task_result(self) -> None:
+        try:
+            status, payload = self._create_task_result_queue.get_nowait()
+        except Empty:
+            self._create_task_poll_after_id = self.after(150, self._poll_create_task_result)
+            return
+
+        self._create_task_poll_after_id = None
+        self._create_task_thread = None
+        self._hide_loading()
+        self._set_create_task_enabled(True)
+
+        if status == "ok":
+            task = payload
+            self.refresh_tasks()
+            self.review_page.refresh_tasks()
+            messagebox.showinfo("任务已创建", f"Task {task.id} 已完成阶段一分段与热度计算")
+            return
+
+        messagebox.showerror("计算失败", f"创建任务失败：{payload}")
+
+    def _show_loading(self, text: str) -> None:
+        if self.loading_dialog is not None and self.loading_dialog.winfo_exists():
+            return
+
+        dialog = tk.Toplevel(self)
+        dialog.title("处理中")
+        dialog.geometry("420x120")
+        dialog.transient(self)
+        dialog.resizable(False, False)
+        dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text=text).pack(fill="x", pady=(0, 10))
+
+        progress = ttk.Progressbar(frame, mode="indeterminate", length=380)
+        progress.pack(fill="x")
+        progress.start(10)
+
+        dialog.grab_set()
+        self.loading_dialog = dialog
+        self.loading_progress = progress
+
+    def _hide_loading(self) -> None:
+        if self.loading_progress is not None:
+            self.loading_progress.stop()
+        self.loading_progress = None
+
+        if self.loading_dialog is not None and self.loading_dialog.winfo_exists():
+            self.loading_dialog.grab_release()
+            self.loading_dialog.destroy()
+        self.loading_dialog = None
+
+    def _set_create_task_enabled(self, enabled: bool) -> None:
+        if self.create_task_button is None:
+            return
+        state = "normal" if enabled else "disabled"
+        self.create_task_button.config(state=state)
 
     def refresh_tasks(self) -> None:
         self.tasks_tree.delete(*self.tasks_tree.get_children())
@@ -127,4 +211,11 @@ class MainWindow(tk.Tk):
             return
         msg = self.stage3_stub.enqueue(task_id)
         messagebox.showinfo("第三阶段", msg)
+
+    def on_close(self) -> None:
+        if self._create_task_poll_after_id is not None:
+            self.after_cancel(self._create_task_poll_after_id)
+            self._create_task_poll_after_id = None
+        self._hide_loading()
+        self.destroy()
 
