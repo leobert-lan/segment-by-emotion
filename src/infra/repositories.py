@@ -137,6 +137,18 @@ class TaskRepository:
                 (label, segment_id),
             )
 
+    def update_segments_heat_score(self, segment_ids: list[int], new_heat_score: float) -> int:
+        if not segment_ids:
+            return 0
+        placeholders = ",".join("?" for _ in segment_ids)
+        params = [new_heat_score, *segment_ids]
+        with self.database.session() as connection:
+            cursor = connection.execute(
+                f"UPDATE segments SET heat_score = ? WHERE id IN ({placeholders})",
+                params,
+            )
+        return int(cursor.rowcount or 0)
+
     def get_segment(self, segment_id: int) -> Segment:
         with self.database.session() as connection:
             row = connection.execute("SELECT * FROM segments WHERE id = ?", (segment_id,)).fetchone()

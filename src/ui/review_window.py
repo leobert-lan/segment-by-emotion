@@ -1,9 +1,18 @@
 import tkinter as tk
 import os
 import struct
+from dataclasses import dataclass
 from tkinter import messagebox, ttk
 
 from src.services.review_service import ReviewService
+
+
+@dataclass
+class TrackItem:
+    start_sec: float
+    end_sec: float
+    is_gap: bool
+    in_threshold: bool = False
 
 
 class ReviewWindow(ttk.Frame):
@@ -16,14 +25,17 @@ class ReviewWindow(ttk.Frame):
         self.task_var = tk.StringVar()
         self.threshold_min_var = tk.StringVar(value="0.40")
         self.threshold_max_var = tk.StringVar(value="1.00")
-        self.window_duration_var = tk.StringVar(value="600")
+        self.window_duration_var = tk.StringVar(value="20000")
         self.window_start_var = tk.StringVar(value="0")
         self.timeline_info_var = tk.StringVar(value="时间窗 0s - 0s / 总时长 0s")
+        self.duration_summary_var = tk.StringVar(value="筛选时长 00:00 (0.0%) | 有趣时长 00:00 (0.0%)")
         self.seek_info_var = tk.StringVar(value="当前定位: 00:00")
+        self.edit_state_var = tk.StringVar(value="编辑: 未启用")
 
         self.task_combo = None
         self.segments_tree = None
         self.heat_canvas = None
+        self.local_progress_canvas = None
         self.total_duration_sec = 0.0
         self.current_seek_sec = 0.0
 
@@ -37,6 +49,7 @@ class ReviewWindow(ttk.Frame):
         self._selected_vlc_dir: str | None = None
         self._player_time_after_id: str | None = None
         self._heatline_redraw_after_id: str | None = None
+        self._local_progress_redraw_after_id: str | None = None
 
         self._candidate_segments = []
         self._candidate_index = -1
@@ -44,10 +57,21 @@ class ReviewWindow(ttk.Frame):
 
         self.video_panel = None
         self.video_status_var = tk.StringVar(value="播放器状态: 未初始化")
+        self.candidate_loop_var = tk.BooleanVar(value=False)
         self.playback_rate_var = tk.StringVar(value="1.0")
         self.volume_var = tk.IntVar(value=70)
 
         self._window_candidates = []
+        self._all_segments_cache = []
+        self._local_track_items: list[TrackItem] = []
+        self._local_track_range = (0.0, 0.0)
+        self._edit_boundary: str | None = None
+        self._merge_start_sec: float | None = None
+        self._merge_end_sec: float | None = None
+        self._edit_step_sec = 0.2
+        self._dragging_boundary: str | None = None
+        self._drag_min_gap_sec = 0.1
+        self._drag_hit_px = 8
         self._tree_sort_column = "start"
         self._tree_sort_desc = False
 
@@ -108,8 +132,12 @@ class ReviewWindow(ttk.Frame):
         ttk.Button(player_controls, text="播放", command=self.play_current).pack(side="left", padx=4)
         ttk.Button(player_controls, text="暂停", command=self.pause_current).pack(side="left", padx=4)
         ttk.Button(player_controls, text="停止", command=self.stop_current).pack(side="left", padx=4)
-        ttk.Button(player_controls, text="仅播放候选片段", command=self.play_candidate_segments).pack(side="left", padx=4)
-        ttk.Button(player_controls, text="停止候选轮播", command=self.stop_candidate_segments).pack(side="left", padx=4)
+        ttk.Checkbutton(
+            player_controls,
+            text="仅播放候选片段",
+            variable=self.candidate_loop_var,
+            command=self.on_toggle_candidate_loop,
+        ).pack(side="left", padx=4)
 
         ttk.Label(player_controls, text="倍速").pack(side="left", padx=(16, 4))
         speed_box = ttk.Combobox(
@@ -135,9 +163,30 @@ class ReviewWindow(ttk.Frame):
         ttk.Label(player_controls, textvariable=self.volume_var, width=4).pack(side="left")
         ttk.Label(player_controls, textvariable=self.video_status_var).pack(side="right")
 
+        local_progress_row = ttk.Frame(video_wrap)
+        local_progress_row.pack(fill="x", padx=8, pady=(0, 8))
+        self.local_progress_canvas = tk.Canvas(local_progress_row, height=72, bg="#f8f8f8")
+        self.local_progress_canvas.pack(side="left", fill="x", expand=True)
+        self.local_progress_canvas.bind("<ButtonPress-1>", self.on_press_local_progress)
+        self.local_progress_canvas.bind("<B1-Motion>", self.on_drag_local_progress)
+        self.local_progress_canvas.bind("<ButtonRelease-1>", self.on_release_local_progress)
+        self.local_progress_canvas.bind("<Configure>", lambda _event: self._schedule_local_progress_redraw())
+        ttk.Button(local_progress_row, text="暂停并定位", command=self.pause_and_locate_segment).pack(
+            side="left", padx=(8, 0)
+        )
+        ttk.Button(local_progress_row, text="编辑起点", command=lambda: self.start_boundary_edit("start")).pack(
+            side="left", padx=(8, 0)
+        )
+        ttk.Button(local_progress_row, text="编辑终点", command=lambda: self.start_boundary_edit("end")).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Button(local_progress_row, text="确认合并", command=self.confirm_merge_range).pack(side="left", padx=(6, 0))
+        ttk.Label(local_progress_row, textvariable=self.edit_state_var).pack(side="left", padx=(10, 0))
+
         timeline_wrap = ttk.LabelFrame(self, text="热度时间轴")
         timeline_wrap.pack(fill="x", padx=10, pady=(0, 8))
         ttk.Label(timeline_wrap, textvariable=self.timeline_info_var).pack(anchor="w", padx=8, pady=(6, 2))
+        ttk.Label(timeline_wrap, textvariable=self.duration_summary_var).pack(anchor="w", padx=8, pady=(0, 2))
         self.heat_canvas = tk.Canvas(timeline_wrap, height=150, bg="#fafafa")
         self.heat_canvas.pack(fill="x", padx=8, pady=(0, 8))
         self.heat_canvas.bind("<Button-1>", self.on_click_heatline)
@@ -167,6 +216,8 @@ class ReviewWindow(ttk.Frame):
 
         self.bind_all("i", lambda _event: self.mark_selected("interesting"))
         self.bind_all("u", lambda _event: self.mark_selected("uninteresting"))
+        self.bind_all("<Left>", lambda _event: self.nudge_selected_boundary(-self._edit_step_sec))
+        self.bind_all("<Right>", lambda _event: self.nudge_selected_boundary(self._edit_step_sec))
 
     def refresh_tasks(self) -> None:
         tasks = self.review_service.list_tasks()
@@ -182,13 +233,18 @@ class ReviewWindow(ttk.Frame):
             return
         self.current_task_id = int(raw.split("|", maxsplit=1)[0].strip())
         self.total_duration_sec = self.review_service.get_task_duration_sec(self.current_task_id)
+        self._all_segments_cache = sorted(self.review_service.list_all_segments(self.current_task_id), key=lambda x: x.start_sec)
+        default_window = min(20000.0, self.total_duration_sec) if self.total_duration_sec > 0 else 20000.0
+        self.window_duration_var.set(f"{default_window:.0f}")
         self.window_start_var.set("0")
         self.current_seek_sec = 0.0
+        self.clear_merge_range()
         self.seek_info_var.set(f"当前定位: {self._format_time(0.0)}")
         self.stop_candidate_segments()
         self._load_media_for_current_task()
         self._schedule_heatline_redraw()
         self.refresh_candidates()
+        self._schedule_local_progress_redraw()
 
     def parse_window_params(self) -> tuple[float, float, float]:
         try:
@@ -201,6 +257,9 @@ class ReviewWindow(ttk.Frame):
             raise ValueError("窗口时长必须大于0")
         if window_start < 0:
             raise ValueError("窗口起点不能小于0")
+
+        if self.total_duration_sec > 0:
+            window_duration = min(window_duration, self.total_duration_sec)
 
         max_start = max(0.0, self.total_duration_sec - window_duration)
         clamped_start = min(window_start, max_start)
@@ -216,6 +275,7 @@ class ReviewWindow(ttk.Frame):
             messagebox.showerror("窗口参数错误", str(error))
             return
 
+        self.window_duration_var.set(f"{_window_duration:.0f}")
         self.window_start_var.set(f"{window_start:.0f}")
         self.refresh_candidates()
         self._schedule_heatline_redraw()
@@ -272,13 +332,16 @@ class ReviewWindow(ttk.Frame):
             window_start_sec=window_start,
             window_end_sec=window_end,
         )
+        self._all_segments_cache = sorted(self.review_service.list_all_segments(self.current_task_id), key=lambda x: x.start_sec)
         self._window_candidates = list(rows)
         self._tree_sort_column = "start"
         self._tree_sort_desc = False
         self._refresh_tree_header_texts()
         self._render_segments_table()
+        self._refresh_duration_summary(min_t, max_t)
         self._set_timeline_info(window_start, window_end)
         self._schedule_heatline_redraw()
+        self._schedule_local_progress_redraw()
 
     def mark_selected(self, label: str) -> None:
         if self.current_task_id is None:
@@ -351,6 +414,8 @@ class ReviewWindow(ttk.Frame):
         if self.current_task_id is None or not self._ensure_player_ready():
             return
 
+        if self.candidate_loop_var.get():
+            self.candidate_loop_var.set(False)
         self._cancel_candidate_tick()
         self._player.play()
         self.after(120, lambda: self._player.set_time(int(max(0.0, seek_sec) * 1000)))
@@ -358,6 +423,7 @@ class ReviewWindow(ttk.Frame):
         current_text = self._format_time(self.current_seek_sec, include_tenths=True)
         self.seek_info_var.set(f"当前定位: {current_text}")
         self.video_status_var.set(f"播放器状态: 播放中 ({current_text})")
+        self._schedule_local_progress_redraw()
 
     def on_click_heatline(self, event) -> None:
         if self.total_duration_sec <= 0:
@@ -372,6 +438,132 @@ class ReviewWindow(ttk.Frame):
         self.seek_info_var.set(f"当前定位: {current_text}")
         if self._player_available:
             self.video_status_var.set(f"播放器状态: 已定位到 {current_text}")
+        self._schedule_local_progress_redraw()
+
+    def on_press_local_progress(self, event) -> None:
+        if self._merge_start_sec is not None and self._merge_end_sec is not None:
+            handle = self._hit_test_merge_handle(event.x)
+            if handle is not None:
+                self._dragging_boundary = handle
+                self._edit_boundary = handle
+                self.edit_state_var.set(f"编辑: 拖拽{'起点' if handle == 'start' else '终点'}")
+                self._schedule_local_progress_redraw()
+                return
+        self._dragging_boundary = None
+        self._seek_from_local_progress_x(event.x)
+
+    def on_drag_local_progress(self, event) -> None:
+        if self._dragging_boundary is None:
+            return
+        sec_value = self._local_x_to_sec(event.x)
+        self._set_merge_boundary(self._dragging_boundary, sec_value)
+
+    def on_release_local_progress(self, _event) -> None:
+        self._dragging_boundary = None
+
+    def _seek_from_local_progress_x(self, x_value: float) -> None:
+        if not self._local_track_items:
+            return
+        range_start, range_end = self._local_track_range
+        if range_end <= range_start:
+            return
+        axis_left, axis_right = self._local_axis_bounds()
+        x = min(max(x_value, axis_left), axis_right)
+        ratio = (x - axis_left) / (axis_right - axis_left)
+        self.current_seek_sec = range_start + ratio * (range_end - range_start)
+        if self._player is not None and self._player_available:
+            try:
+                self._player.set_time(int(self.current_seek_sec * 1000))
+            except Exception:
+                pass
+        self.seek_info_var.set(f"当前定位: {self._format_time(self.current_seek_sec, include_tenths=True)}")
+        self._select_segment_by_time(self.current_seek_sec)
+        self._schedule_local_progress_redraw()
+
+    def on_toggle_candidate_loop(self) -> None:
+        if self.candidate_loop_var.get():
+            self.play_candidate_segments()
+            return
+        self.stop_candidate_segments(show_message=False)
+
+    def start_boundary_edit(self, boundary: str) -> None:
+        if boundary not in ("start", "end"):
+            return
+        selected = self.segments_tree.selection()
+        if not selected:
+            messagebox.showinfo("提示", "请先在下方列表选择一个片段")
+            return
+        values = self.segments_tree.item(selected[0], "values")
+        segment = self._find_cached_segment(int(values[0]))
+        if segment is None:
+            return
+        if self._merge_start_sec is None or self._merge_end_sec is None:
+            self._merge_start_sec = segment.start_sec
+            self._merge_end_sec = segment.end_sec
+        self._edit_boundary = boundary
+        self.edit_state_var.set(
+            f"编辑: {'起点' if boundary == 'start' else '终点'} (左右键微调 {self._edit_step_sec:.1f}s)"
+        )
+        self._schedule_local_progress_redraw()
+
+    def nudge_selected_boundary(self, delta_sec: float) -> None:
+        if self._edit_boundary is None:
+            return
+        if self._merge_start_sec is None or self._merge_end_sec is None:
+            self._merge_start_sec = self.current_seek_sec
+            self._merge_end_sec = self.current_seek_sec + self._drag_min_gap_sec
+        current_value = self._merge_start_sec if self._edit_boundary == "start" else self._merge_end_sec
+        self._set_merge_boundary(self._edit_boundary, current_value + delta_sec)
+
+    def clear_merge_range(self) -> None:
+        self._edit_boundary = None
+        self._dragging_boundary = None
+        self._merge_start_sec = None
+        self._merge_end_sec = None
+        self.edit_state_var.set("编辑: 未启用")
+
+    def confirm_merge_range(self) -> None:
+        if self.current_task_id is None:
+            return
+        if self._merge_start_sec is None or self._merge_end_sec is None:
+            messagebox.showinfo("提示", "请先选择片段并设置合并区间")
+            return
+        affected_count, max_heat = self.review_service.merge_candidate_heat_in_range(
+            self.current_task_id,
+            self._merge_start_sec,
+            self._merge_end_sec,
+        )
+        if affected_count <= 0:
+            messagebox.showinfo("提示", "合并区间内没有可更新的候选片段")
+            return
+        self._all_segments_cache = sorted(self.review_service.list_all_segments(self.current_task_id), key=lambda x: x.start_sec)
+        self.refresh_candidates()
+        self.clear_merge_range()
+        self._schedule_local_progress_redraw()
+        messagebox.showinfo("已完成", f"已更新 {affected_count} 个片段热度为 {max_heat:.3f}")
+
+    def pause_and_locate_segment(self) -> None:
+        if self._player is not None and self._player_available:
+            try:
+                self._player.set_pause(1)
+            except Exception:
+                try:
+                    self._player.pause()
+                except Exception:
+                    pass
+        self.video_status_var.set("播放器状态: 暂停")
+
+        segment = self._find_segment_by_time(self.current_seek_sec, self._window_candidates)
+        if segment is None:
+            messagebox.showinfo("提示", "当前位置不在当前筛选片段中")
+            return
+        item_id = str(segment.id)
+        if not self.segments_tree.exists(item_id):
+            return
+        self.segments_tree.selection_set(item_id)
+        self.segments_tree.focus(item_id)
+        self.segments_tree.see(item_id)
+        self._schedule_local_progress_redraw()
 
     def _init_player(self) -> None:
         if self._player_ready and self._player is not None:
@@ -570,7 +762,8 @@ class ReviewWindow(ttk.Frame):
     def stop_current(self) -> None:
         if not self._ensure_player_ready():
             return
-        self.stop_candidate_segments()
+        self.candidate_loop_var.set(False)
+        self.stop_candidate_segments(show_message=False)
         self._player.stop()
         self.video_status_var.set("播放器状态: 停止")
 
@@ -609,6 +802,7 @@ class ReviewWindow(ttk.Frame):
             min_t, max_t = self.get_thresholds()
             _window_duration, window_start, window_end = self.parse_window_params()
         except ValueError as error:
+            self.candidate_loop_var.set(False)
             messagebox.showerror("参数错误", str(error))
             return
 
@@ -620,6 +814,7 @@ class ReviewWindow(ttk.Frame):
             window_end_sec=window_end,
         )
         if not segments:
+            self.candidate_loop_var.set(False)
             messagebox.showinfo("提示", "当前时间窗没有候选片段")
             return
 
@@ -680,6 +875,8 @@ class ReviewWindow(ttk.Frame):
         had_loop = bool(self._candidate_segments)
         self._candidate_segments = []
         self._candidate_index = -1
+        if self.candidate_loop_var.get():
+            self.candidate_loop_var.set(False)
         if show_message and had_loop:
             messagebox.showinfo("提示", "候选轮播已停止")
 
@@ -697,6 +894,7 @@ class ReviewWindow(ttk.Frame):
                     self.seek_info_var.set(
                         f"当前定位: {self._format_time(self.current_seek_sec, include_tenths=True)}"
                     )
+                    self._schedule_local_progress_redraw()
             self._player_time_after_id = self.after(300, tick)
 
         tick()
@@ -711,6 +909,16 @@ class ReviewWindow(ttk.Frame):
                 pass
         self._heatline_redraw_after_id = self.after(40, self.draw_heatline)
 
+    def _schedule_local_progress_redraw(self) -> None:
+        if self.local_progress_canvas is None or not self.winfo_exists():
+            return
+        if self._local_progress_redraw_after_id is not None:
+            try:
+                self.after_cancel(self._local_progress_redraw_after_id)
+            except Exception:
+                pass
+        self._local_progress_redraw_after_id = self.after(40, self.draw_local_progress)
+
     def _on_destroy(self, event) -> None:
         if event.widget is not self:
             return
@@ -721,6 +929,12 @@ class ReviewWindow(ttk.Frame):
             except Exception:
                 pass
             self._heatline_redraw_after_id = None
+        if self._local_progress_redraw_after_id is not None:
+            try:
+                self.after_cancel(self._local_progress_redraw_after_id)
+            except Exception:
+                pass
+            self._local_progress_redraw_after_id = None
         if self._player_time_after_id is not None:
             try:
                 self.after_cancel(self._player_time_after_id)
@@ -810,6 +1024,231 @@ class ReviewWindow(ttk.Frame):
                 color = "#ff9800"
             self.heat_canvas.create_rectangle(x0, y0, x1, y1, fill=color, outline="")
 
+    def draw_local_progress(self) -> None:
+        self._local_progress_redraw_after_id = None
+        if self.local_progress_canvas is None or not self.winfo_exists():
+            return
+        canvas = self.local_progress_canvas
+        canvas.delete("all")
+        if not self._all_segments_cache:
+            canvas.create_text(10, 24, text="暂无片段数据", fill="#777", anchor="w")
+            return
+
+        try:
+            min_t, max_t = self.get_thresholds()
+        except ValueError:
+            min_t, max_t = 0.0, 1.0
+
+        focus_index = self._find_focus_segment_index(self._all_segments_cache, self.current_seek_sec)
+        if focus_index is None:
+            canvas.create_text(10, 24, text="当前位置不在片段范围内", fill="#777", anchor="w")
+            return
+        focus_segment = self._all_segments_cache[focus_index]
+
+        self._local_track_items, self._local_track_range = self._build_local_track(
+            self._all_segments_cache,
+            focus_index,
+            min_t,
+            max_t,
+        )
+        range_start, range_end = self._local_track_range
+        if range_end <= range_start:
+            return
+
+        width = max(canvas.winfo_width(), 1)
+        axis_left = 20
+        axis_right = max(axis_left + 1, width - 20)
+        bar_top = 18
+        bar_bottom = 42
+        span = range_end - range_start
+
+        loop_hint = "候选轮播已关闭"
+        if self._candidate_segments:
+            loop_hint = f"候选轮播 {self._candidate_index + 1}/{len(self._candidate_segments)}"
+        status = "筛选内" if min_t <= focus_segment.heat_score <= max_t else "筛选外"
+        canvas.create_text(
+            axis_left,
+            6,
+            text=(
+                f"当前片段 #{focus_segment.id} {self._format_time(focus_segment.start_sec, include_tenths=True)}"
+                f"-{self._format_time(focus_segment.end_sec, include_tenths=True)} | {status} | {loop_hint}"
+            ),
+            anchor="nw",
+            fill="#444",
+        )
+
+        for item in self._local_track_items:
+            x0 = axis_left + ((item.start_sec - range_start) / span) * (axis_right - axis_left)
+            x1 = axis_left + ((item.end_sec - range_start) / span) * (axis_right - axis_left)
+            if item.is_gap:
+                fill = "#ffffff"
+                outline = "#c7c7c7"
+            else:
+                fill = "#4caf50" if item.in_threshold else "#cfcfcf"
+                outline = ""
+            canvas.create_rectangle(x0, bar_top, x1, bar_bottom, fill=fill, outline=outline)
+
+        if self._merge_start_sec is not None and self._merge_end_sec is not None:
+            merge_start = min(self._merge_start_sec, self._merge_end_sec)
+            merge_end = max(self._merge_start_sec, self._merge_end_sec)
+            merge_x0 = axis_left + ((max(merge_start, range_start) - range_start) / span) * (axis_right - axis_left)
+            merge_x1 = axis_left + ((min(merge_end, range_end) - range_start) / span) * (axis_right - axis_left)
+            canvas.create_rectangle(merge_x0, bar_top - 4, merge_x1, bar_bottom + 4, outline="#ff9800", width=2)
+            start_color = "#ef6c00" if self._dragging_boundary == "start" else "#ff9800"
+            end_color = "#ef6c00" if self._dragging_boundary == "end" else "#ff9800"
+            canvas.create_oval(merge_x0 - 4, bar_top - 8, merge_x0 + 4, bar_top, fill=start_color, outline="")
+            canvas.create_oval(merge_x1 - 4, bar_top - 8, merge_x1 + 4, bar_top, fill=end_color, outline="")
+
+        self._draw_local_ticks(canvas, axis_left, axis_right, bar_bottom, range_start, span)
+
+        seek_x = axis_left + ((min(max(self.current_seek_sec, range_start), range_end) - range_start) / span) * (
+            axis_right - axis_left
+        )
+        canvas.create_line(seek_x, 10, seek_x, 56, fill="#f44336", width=2)
+        canvas.create_text(seek_x, 58, text=self._format_time(self.current_seek_sec, include_tenths=True), anchor="n", fill="#f44336")
+
+    def _draw_local_ticks(
+        self,
+        canvas: tk.Canvas,
+        axis_left: float,
+        axis_right: float,
+        bar_bottom: float,
+        range_start: float,
+        span: float,
+    ) -> None:
+        if span <= 0:
+            return
+        epsilon = 1e-4
+        seen_labels: set[str] = set()
+        for item in self._local_track_items:
+            if item.is_gap or not item.in_threshold:
+                continue
+            for boundary in (item.start_sec, item.end_sec):
+                x = axis_left + ((boundary - range_start) / span) * (axis_right - axis_left)
+                canvas.create_line(x, bar_bottom + 1, x, bar_bottom + 7, fill="#2e7d32")
+                bucket = f"{round(boundary / epsilon) * epsilon:.4f}"
+                if bucket in seen_labels:
+                    continue
+                seen_labels.add(bucket)
+                canvas.create_text(x, bar_bottom + 9, text=self._format_time(boundary), anchor="n", fill="#2e7d32")
+
+    @staticmethod
+    def _find_focus_segment_index(segments, seek_sec: float) -> int | None:
+        if not segments:
+            return None
+        epsilon = 1e-6
+        for i, segment in enumerate(segments):
+            is_last = i == len(segments) - 1
+            in_range = segment.start_sec - epsilon <= seek_sec < segment.end_sec - epsilon
+            if in_range or (is_last and seek_sec <= segment.end_sec + epsilon):
+                return i
+            if seek_sec < segment.start_sec:
+                return max(0, i - 1)
+        return len(segments) - 1
+
+    @staticmethod
+    def _build_local_track(segments, focus_index: int, min_t: float, max_t: float) -> tuple[list[TrackItem], tuple[float, float]]:
+        start_idx = max(0, focus_index - 4)
+        end_idx = min(len(segments), focus_index + 5)
+        selected = segments[start_idx:end_idx]
+        if not selected:
+            return [], (0.0, 0.0)
+
+        result: list[TrackItem] = []
+        gap_count = 0
+        epsilon = 1e-4
+        prev_end = None
+        for segment in selected:
+            if prev_end is not None and segment.start_sec > prev_end + epsilon and gap_count < 10:
+                result.append(TrackItem(start_sec=prev_end, end_sec=segment.start_sec, is_gap=True))
+                gap_count += 1
+            result.append(
+                TrackItem(
+                    start_sec=segment.start_sec,
+                    end_sec=segment.end_sec,
+                    is_gap=False,
+                    in_threshold=min_t <= segment.heat_score <= max_t,
+                )
+            )
+            prev_end = segment.end_sec
+        return result, (selected[0].start_sec, selected[-1].end_sec)
+
+    @staticmethod
+    def _find_segment_by_time(seek_sec: float, segments):
+        epsilon = 1e-6
+        for segment in segments:
+            if segment.start_sec - epsilon <= seek_sec <= segment.end_sec + epsilon:
+                return segment
+        return None
+
+    def _select_segment_by_time(self, seek_sec: float) -> None:
+        segment = self._find_segment_by_time(seek_sec, self._window_candidates)
+        if segment is None:
+            return
+        item_id = str(segment.id)
+        if not self.segments_tree.exists(item_id):
+            return
+        self.segments_tree.selection_set(item_id)
+        self.segments_tree.focus(item_id)
+        self.segments_tree.see(item_id)
+
+    def _local_axis_bounds(self) -> tuple[float, float]:
+        width = max(self.local_progress_canvas.winfo_width(), 1)
+        axis_left = 20
+        axis_right = max(axis_left + 1, width - 20)
+        return axis_left, axis_right
+
+    def _local_x_to_sec(self, x_value: float) -> float:
+        range_start, range_end = self._local_track_range
+        if range_end <= range_start:
+            return range_start
+        axis_left, axis_right = self._local_axis_bounds()
+        x = min(max(x_value, axis_left), axis_right)
+        ratio = (x - axis_left) / (axis_right - axis_left)
+        return range_start + ratio * (range_end - range_start)
+
+    def _sec_to_local_x(self, sec_value: float) -> float:
+        range_start, range_end = self._local_track_range
+        axis_left, axis_right = self._local_axis_bounds()
+        if range_end <= range_start:
+            return axis_left
+        clamped = min(max(sec_value, range_start), range_end)
+        ratio = (clamped - range_start) / (range_end - range_start)
+        return axis_left + ratio * (axis_right - axis_left)
+
+    def _hit_test_merge_handle(self, x_value: float) -> str | None:
+        if self._merge_start_sec is None or self._merge_end_sec is None:
+            return None
+        start_x = self._sec_to_local_x(min(self._merge_start_sec, self._merge_end_sec))
+        end_x = self._sec_to_local_x(max(self._merge_start_sec, self._merge_end_sec))
+        distance_start = abs(x_value - start_x)
+        distance_end = abs(x_value - end_x)
+        if distance_start > self._drag_hit_px and distance_end > self._drag_hit_px:
+            return None
+        return "start" if distance_start <= distance_end else "end"
+
+    def _set_merge_boundary(self, boundary: str, target_sec: float) -> None:
+        range_start, range_end = self._local_track_range
+        if range_end <= range_start:
+            return
+        if self._merge_start_sec is None or self._merge_end_sec is None:
+            self._merge_start_sec = range_start
+            self._merge_end_sec = min(range_end, range_start + self._drag_min_gap_sec)
+
+        if boundary == "start":
+            limit = self._merge_end_sec - self._drag_min_gap_sec
+            self._merge_start_sec = max(range_start, min(target_sec, limit))
+        else:
+            limit = self._merge_start_sec + self._drag_min_gap_sec
+            self._merge_end_sec = min(range_end, max(target_sec, limit))
+
+        self.edit_state_var.set(
+            "编辑区间: "
+            f"{self._format_time(self._merge_start_sec, include_tenths=True)} - "
+            f"{self._format_time(self._merge_end_sec, include_tenths=True)}"
+        )
+        self._schedule_local_progress_redraw()
+
     def _find_cached_segment(self, segment_id: int):
         for segment in self._window_candidates:
             if segment.id == segment_id:
@@ -823,6 +1262,23 @@ class ReviewWindow(ttk.Frame):
         self.timeline_info_var.set(
             f"窗口 {self._format_time(window_start)} - {self._format_time(window_end)} "
             f"(时长 {self._format_time(window_len)}) / 总时长 {self._format_time(total)} | 覆盖 {ratio:.1f}%"
+        )
+
+    def _refresh_duration_summary(self, min_threshold: float, max_threshold: float) -> None:
+        if self.current_task_id is None:
+            self.duration_summary_var.set("筛选时长 00:00 (0.0%) | 有趣时长 00:00 (0.0%)")
+            return
+        filtered_sec, interesting_sec = self.review_service.get_duration_stats(
+            self.current_task_id,
+            min_threshold,
+            max_threshold,
+        )
+        total = max(0.0, self.total_duration_sec)
+        filtered_ratio = (filtered_sec / total * 100.0) if total > 0 else 0.0
+        interesting_ratio = (interesting_sec / total * 100.0) if total > 0 else 0.0
+        self.duration_summary_var.set(
+            f"筛选时长 {self._format_time(filtered_sec)} ({filtered_ratio:.1f}%) | "
+            f"有趣时长 {self._format_time(interesting_sec)} ({interesting_ratio:.1f}%)"
         )
 
     def _format_time(self, seconds: float, include_tenths: bool = False) -> str:
@@ -883,6 +1339,7 @@ class ReviewWindow(ttk.Frame):
             self.segments_tree.insert(
                 "",
                 "end",
+                iid=str(segment.id),
                 values=(
                     segment.id,
                     self._format_time(segment.start_sec, include_tenths=True),

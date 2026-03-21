@@ -48,6 +48,48 @@ class ReviewService:
             window_end_sec=window_end_sec,
         )
 
+    def merge_candidate_heat_in_range(self, task_id: int, range_start_sec: float, range_end_sec: float) -> tuple[int, float]:
+        start_sec = min(range_start_sec, range_end_sec)
+        end_sec = max(range_start_sec, range_end_sec)
+        if end_sec <= start_sec:
+            return 0, 0.0
+
+        segments = self.task_repository.list_segments_in_window(
+            task_id=task_id,
+            window_start_sec=start_sec,
+            window_end_sec=end_sec,
+            include_labeled=False,
+        )
+        if not segments:
+            return 0, 0.0
+
+        max_heat = max(segment.heat_score for segment in segments)
+        affected_count = self.task_repository.update_segments_heat_score([segment.id for segment in segments], max_heat)
+        return affected_count, max_heat
+
+    def get_duration_stats(self, task_id: int, min_threshold: float, max_threshold: float) -> tuple[float, float]:
+        segments = self.list_all_segments(task_id)
+        filtered = [
+            segment
+            for segment in segments
+            if segment.current_label is None and min_threshold <= segment.heat_score <= max_threshold
+        ]
+        interesting = [segment for segment in segments if segment.current_label == "interesting"]
+        return self._deduplicated_duration(filtered), self._deduplicated_duration(interesting)
+
+    @staticmethod
+    def _deduplicated_duration(segments: list[Segment]) -> float:
+        if not segments:
+            return 0.0
+        intervals = sorted((segment.start_sec, segment.end_sec) for segment in segments)
+        merged: list[list[float]] = []
+        for start_sec, end_sec in intervals:
+            if not merged or start_sec > merged[-1][1]:
+                merged.append([start_sec, end_sec])
+                continue
+            merged[-1][1] = max(merged[-1][1], end_sec)
+        return sum(end_sec - start_sec for start_sec, end_sec in merged)
+
     def mark_segment(self, task_id: int, segment_id: int, new_label: str) -> None:
         segment = self.task_repository.get_segment(segment_id)
         self.task_repository.update_segment_label(segment_id=segment_id, label=new_label)
