@@ -1,4 +1,6 @@
 import tkinter as tk
+import os
+import struct
 from tkinter import messagebox, ttk
 
 from src.services.review_service import ReviewService
@@ -30,7 +32,11 @@ class ReviewWindow(ttk.Frame):
         self._player = None
         self._player_ready = False
         self._player_available = False
+        self._player_init_attempted = False
+        self._player_error_detail = ""
+        self._selected_vlc_dir: str | None = None
         self._player_time_after_id: str | None = None
+        self._heatline_redraw_after_id: str | None = None
 
         self._candidate_segments = []
         self._candidate_index = -1
@@ -41,48 +47,51 @@ class ReviewWindow(ttk.Frame):
         self.playback_rate_var = tk.StringVar(value="1.0")
 
         self._build_layout()
-        self.after(200, self._init_player)
         self.refresh_tasks()
         self.bind("<Destroy>", self._on_destroy, add="+")
 
     def _build_layout(self) -> None:
-        controls = ttk.Frame(self)
+        controls = ttk.LabelFrame(self, text="任务与筛选")
         controls.pack(fill="x", padx=10, pady=8)
 
-        self.task_combo = ttk.Combobox(controls, textvariable=self.task_var, state="readonly", width=50)
-
-        ttk.Label(controls, text="任务").grid(row=0, column=0, sticky="w")
-        self.task_combo.grid(row=0, column=1, columnspan=4, sticky="ew", padx=6)
+        task_row = ttk.Frame(controls)
+        task_row.pack(fill="x", padx=8, pady=(6, 4))
+        ttk.Label(task_row, text="任务").pack(side="left")
+        self.task_combo = ttk.Combobox(task_row, textvariable=self.task_var, state="readonly", width=70)
+        self.task_combo.pack(side="left", fill="x", expand=True, padx=8)
         self.task_combo.bind("<<ComboboxSelected>>", lambda _event: self.on_select_task())
 
-        ttk.Label(controls, text="窗口时长(秒)").grid(row=1, column=0, sticky="w", pady=6)
-        ttk.Entry(controls, textvariable=self.window_duration_var, width=10).grid(row=1, column=1, sticky="w")
-        ttk.Label(controls, text="窗口起点(秒)").grid(row=1, column=2, sticky="w")
-        ttk.Entry(controls, textvariable=self.window_start_var, width=10).grid(row=1, column=3, sticky="w")
-        ttk.Button(controls, text="加载窗口", command=self.reload_window).grid(row=1, column=4, padx=4)
+        window_row = ttk.Frame(controls)
+        window_row.pack(fill="x", padx=8, pady=4)
+        ttk.Label(window_row, text="窗口时长(秒)").pack(side="left")
+        ttk.Entry(window_row, textvariable=self.window_duration_var, width=10).pack(side="left", padx=(4, 12))
+        ttk.Label(window_row, text="窗口起点(秒)").pack(side="left")
+        ttk.Entry(window_row, textvariable=self.window_start_var, width=10).pack(side="left", padx=4)
+        ttk.Button(window_row, text="加载窗口", command=self.reload_window).pack(side="left", padx=(8, 4))
+        ttk.Button(window_row, text="上一段", command=self.prev_window).pack(side="left", padx=4)
+        ttk.Button(window_row, text="下一段", command=self.next_window).pack(side="left", padx=4)
 
-        ttk.Button(controls, text="上一段", command=self.prev_window).grid(row=2, column=1, pady=6)
-        ttk.Button(controls, text="下一段", command=self.next_window).grid(row=2, column=2, pady=6)
+        threshold_row = ttk.Frame(controls)
+        threshold_row.pack(fill="x", padx=8, pady=4)
+        ttk.Label(threshold_row, text="阈值最小").pack(side="left")
+        ttk.Entry(threshold_row, textvariable=self.threshold_min_var, width=8).pack(side="left", padx=(4, 12))
+        ttk.Label(threshold_row, text="阈值最大").pack(side="left")
+        ttk.Entry(threshold_row, textvariable=self.threshold_max_var, width=8).pack(side="left", padx=4)
+        ttk.Button(threshold_row, text="应用筛选", command=self.refresh_candidates).pack(side="left", padx=(8, 4))
+        ttk.Button(threshold_row, text="加载说话人档案", command=self.load_profile).pack(side="left", padx=4)
+        ttk.Button(threshold_row, text="保存说话人档案", command=self.save_profile).pack(side="left", padx=4)
 
-        ttk.Label(controls, text="阈值最小").grid(row=3, column=0, sticky="w", pady=6)
-        ttk.Entry(controls, textvariable=self.threshold_min_var, width=8).grid(row=3, column=1, sticky="w")
-        ttk.Label(controls, text="阈值最大").grid(row=3, column=2, sticky="w")
-        ttk.Entry(controls, textvariable=self.threshold_max_var, width=8).grid(row=3, column=3, sticky="w")
-
-        ttk.Button(controls, text="应用筛选", command=self.refresh_candidates).grid(row=3, column=4, padx=4)
-        ttk.Button(controls, text="加载说话人档案", command=self.load_profile).grid(row=4, column=1, pady=6)
-        ttk.Button(controls, text="保存说话人档案", command=self.save_profile).grid(row=4, column=2, pady=6)
-        ttk.Button(controls, text="撤销上次标记", command=self.undo_last).grid(row=4, column=3, pady=6)
-        ttk.Button(controls, text="完成Review", command=self.complete_review).grid(row=4, column=4, pady=6)
-
-        ttk.Button(controls, text="加载当前视频", command=self._load_media_for_current_task).grid(row=5, column=1, pady=6)
-        ttk.Button(controls, text="从当前定位播放", command=self.play_from_current_seek).grid(row=5, column=2, pady=6)
-        ttk.Button(controls, text="播放所选片段", command=self.play_selected_segment).grid(row=5, column=3, pady=6)
-        ttk.Label(controls, textvariable=self.seek_info_var).grid(row=5, column=4, sticky="e")
-
-        ttk.Label(controls, textvariable=self.timeline_info_var).grid(row=6, column=0, columnspan=5, sticky="w", pady=(2, 0))
-
-        controls.columnconfigure(1, weight=1)
+        action_row = ttk.Frame(controls)
+        action_row.pack(fill="x", padx=8, pady=(4, 8))
+        ttk.Button(action_row, text="标记有趣 (I)", command=lambda: self.mark_selected("interesting")).pack(side="left", padx=4)
+        ttk.Button(action_row, text="标记无趣 (U)", command=lambda: self.mark_selected("uninteresting")).pack(side="left", padx=4)
+        ttk.Button(action_row, text="撤销上次标记", command=self.undo_last).pack(side="left", padx=4)
+        ttk.Button(action_row, text="完成Review", command=self.complete_review).pack(side="left", padx=4)
+        ttk.Separator(action_row, orient="vertical").pack(side="left", fill="y", padx=8)
+        ttk.Button(action_row, text="加载当前视频", command=self._load_media_for_current_task).pack(side="left", padx=4)
+        ttk.Button(action_row, text="从当前定位播放", command=self.play_from_current_seek).pack(side="left", padx=4)
+        ttk.Button(action_row, text="播放所选片段", command=self.play_selected_segment).pack(side="left", padx=4)
+        ttk.Label(action_row, textvariable=self.seek_info_var).pack(side="right")
 
         video_wrap = ttk.LabelFrame(self, text="视频预览")
         video_wrap.pack(fill="x", padx=10, pady=(0, 8))
@@ -109,6 +118,14 @@ class ReviewWindow(ttk.Frame):
         speed_box.bind("<<ComboboxSelected>>", lambda _event: self.apply_playback_rate())
         ttk.Label(player_controls, textvariable=self.video_status_var).pack(side="right")
 
+        timeline_wrap = ttk.LabelFrame(self, text="热度时间轴")
+        timeline_wrap.pack(fill="x", padx=10, pady=(0, 8))
+        ttk.Label(timeline_wrap, textvariable=self.timeline_info_var).pack(anchor="w", padx=8, pady=(6, 2))
+        self.heat_canvas = tk.Canvas(timeline_wrap, height=150, bg="#fafafa")
+        self.heat_canvas.pack(fill="x", padx=8, pady=(0, 8))
+        self.heat_canvas.bind("<Button-1>", self.on_click_heatline)
+        self.heat_canvas.bind("<Configure>", lambda _event: self._schedule_heatline_redraw())
+
         tree_frame = ttk.Frame(self)
         tree_frame.pack(fill="both", expand=True, padx=10, pady=(0, 6))
 
@@ -128,15 +145,6 @@ class ReviewWindow(ttk.Frame):
         scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.segments_tree.yview)
         self.segments_tree.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
-
-        buttons = ttk.Frame(self)
-        buttons.pack(fill="x", padx=10, pady=6)
-        ttk.Button(buttons, text="标记有趣 (I)", command=lambda: self.mark_selected("interesting")).pack(side="left", padx=4)
-        ttk.Button(buttons, text="标记无趣 (U)", command=lambda: self.mark_selected("uninteresting")).pack(side="left", padx=4)
-
-        self.heat_canvas = tk.Canvas(self, height=140, bg="#fafafa")
-        self.heat_canvas.pack(fill="x", padx=10, pady=(2, 10))
-        self.heat_canvas.bind("<Button-1>", self.on_click_heatline)
 
         self.bind_all("i", lambda _event: self.mark_selected("interesting"))
         self.bind_all("u", lambda _event: self.mark_selected("uninteresting"))
@@ -160,7 +168,7 @@ class ReviewWindow(ttk.Frame):
         self.seek_info_var.set("当前定位: 0s")
         self.stop_candidate_segments()
         self._load_media_for_current_task()
-        self.draw_heatline()
+        self._schedule_heatline_redraw()
         self.refresh_candidates()
 
     def parse_window_params(self) -> tuple[float, float, float]:
@@ -191,7 +199,7 @@ class ReviewWindow(ttk.Frame):
 
         self.window_start_var.set(f"{window_start:.0f}")
         self.refresh_candidates()
-        self.draw_heatline()
+        self._schedule_heatline_redraw()
 
     def prev_window(self) -> None:
         if self.current_task_id is None:
@@ -262,6 +270,7 @@ class ReviewWindow(ttk.Frame):
                     segment.current_label or "",
                 ),
             )
+        self._schedule_heatline_redraw()
 
     def mark_selected(self, label: str) -> None:
         if self.current_task_id is None:
@@ -272,7 +281,7 @@ class ReviewWindow(ttk.Frame):
         segment_id = int(self.segments_tree.item(selected[0], "values")[0])
         self.review_service.mark_segment(self.current_task_id, segment_id, label)
         self.refresh_candidates()
-        self.draw_heatline()
+        self._schedule_heatline_redraw()
         self.on_task_refresh()
 
     def undo_last(self) -> None:
@@ -282,7 +291,7 @@ class ReviewWindow(ttk.Frame):
             messagebox.showinfo("提示", "没有可撤销的标记")
             return
         self.refresh_candidates()
-        self.draw_heatline()
+        self._schedule_heatline_redraw()
         self.on_task_refresh()
 
     def complete_review(self) -> None:
@@ -315,7 +324,6 @@ class ReviewWindow(ttk.Frame):
         self.threshold_min_var.set(f"{profile.min_threshold:.2f}")
         self.threshold_max_var.set(f"{profile.max_threshold:.2f}")
         self.refresh_candidates()
-
 
     def play_from_current_seek(self) -> None:
         self.play_video_at(self.current_seek_sec)
@@ -353,12 +361,24 @@ class ReviewWindow(ttk.Frame):
             self.video_status_var.set(f"播放器状态: 已定位到 {self.current_seek_sec:.1f}s")
 
     def _init_player(self) -> None:
-        if self.video_panel is None:
+        if self._player_ready and self._player is not None:
             return
+        self._player_init_attempted = True
+
+        if self.video_panel is None:
+            self._player_error_detail = "video panel not ready"
+            return
+        self._prepare_vlc_runtime()
         try:
             import vlc
-        except Exception:
-            self.video_status_var.set("播放器状态: 未安装 python-vlc 或 VLC")
+        except OSError as error:
+            self._player_error_detail = self._format_vlc_import_error(error)
+            self.video_status_var.set("播放器状态: VLC加载失败")
+            self._player_available = False
+            return
+        except Exception as error:
+            self._player_error_detail = self._format_vlc_import_error(error)
+            self.video_status_var.set("播放器状态: 未检测到 python-vlc 或 libVLC")
             self._player_available = False
             return
 
@@ -371,17 +391,141 @@ class ReviewWindow(ttk.Frame):
             self._player.set_hwnd(handle)
             self._player_available = True
             self._player_ready = True
+            self._player_error_detail = ""
             self.video_status_var.set("播放器状态: 已就绪")
             self._bind_player_time_update()
         except Exception as error:
             self._player_available = False
+            self._player_error_detail = str(error)
             self.video_status_var.set(f"播放器状态: 初始化失败 ({error})")
 
+    def _prepare_vlc_runtime(self) -> None:
+        if os.name != "nt":
+            return
+
+        candidates = self._find_vlc_install_dirs_windows()
+        python_bitness = self._python_bitness()
+        selected_folder = None
+        fallback_folder = None
+
+        for folder in candidates:
+            if not os.path.exists(os.path.join(folder, "libvlc.dll")):
+                continue
+            folder_bitness = self._guess_vlc_dir_bitness(folder)
+            if folder_bitness == python_bitness and selected_folder is None:
+                selected_folder = folder
+                break
+            if fallback_folder is None:
+                fallback_folder = folder
+
+        chosen = selected_folder or fallback_folder
+        if chosen is None:
+            self._selected_vlc_dir = None
+            return
+
+        self._selected_vlc_dir = chosen
+        path_items = os.environ.get("PATH", "")
+        if chosen not in path_items:
+            os.environ["PATH"] = f"{chosen};{path_items}"
+        add_dll_directory = getattr(os, "add_dll_directory", None)
+        if add_dll_directory is not None:
+            try:
+                add_dll_directory(chosen)
+            except Exception:
+                pass
+        plugin_path = os.path.join(chosen, "plugins")
+        if os.path.isdir(plugin_path) and not os.environ.get("VLC_PLUGIN_PATH"):
+            os.environ["VLC_PLUGIN_PATH"] = plugin_path
+
+    def _python_bitness(self) -> str:
+        return "64" if struct.calcsize("P") * 8 == 64 else "32"
+
+    def _guess_vlc_dir_bitness(self, folder: str) -> str:
+        normalized = folder.lower()
+        if "(x86)" in normalized:
+            return "32"
+        if "program files" in normalized:
+            return "64"
+        return "unknown"
+
+    def _format_vlc_import_error(self, error: Exception) -> str:
+        base = f"import vlc failed: {error}"
+        if os.name != "nt":
+            return base
+
+        winerror = getattr(error, "winerror", None)
+        if winerror != 193:
+            return base
+
+        python_bitness = self._python_bitness()
+        chosen = self._selected_vlc_dir or "未定位到VLC安装目录"
+        expected = "64位VLC" if python_bitness == "64" else "32位VLC"
+        return (
+            f"{base} (WinError 193: 架构不匹配). "
+            f"当前Python为{python_bitness}位, 需要安装{expected}, 或切换到匹配位数的Python。"
+            f" 当前VLC目录: {chosen}"
+        )
+
+    def _find_vlc_install_dirs_windows(self) -> list[str]:
+        python_bitness = self._python_bitness()
+        default_candidates: list[str] = [
+            r"C:\Program Files\VideoLAN\VLC",
+            r"C:\Program Files (x86)\VideoLAN\VLC",
+        ]
+        if python_bitness == "32":
+            default_candidates.reverse()
+
+        candidates: list[str] = []
+
+        env_vlc_dir = os.environ.get("VLC_DIR", "").strip()
+        if env_vlc_dir:
+            candidates.append(env_vlc_dir)
+
+        try:
+            import winreg
+
+            registry_keys = [
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\VideoLAN\VLC"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\VideoLAN\VLC"),
+                (winreg.HKEY_CURRENT_USER, r"SOFTWARE\VideoLAN\VLC"),
+            ]
+            for root, sub_key in registry_keys:
+                try:
+                    with winreg.OpenKey(root, sub_key) as key:
+                        install_dir, _ = winreg.QueryValueEx(key, "InstallDir")
+                        if isinstance(install_dir, str) and install_dir:
+                            candidates.append(install_dir)
+                except OSError:
+                    continue
+        except Exception:
+            pass
+
+        candidates.extend(default_candidates)
+
+        deduped: list[str] = []
+        for path in candidates:
+            normalized = os.path.normpath(path)
+            if normalized not in deduped:
+                deduped.append(normalized)
+
+        matched = [path for path in deduped if self._guess_vlc_dir_bitness(path) == python_bitness]
+        unknown = [path for path in deduped if self._guess_vlc_dir_bitness(path) == "unknown"]
+        mismatched = [path for path in deduped if self._guess_vlc_dir_bitness(path) not in (python_bitness, "unknown")]
+        if matched or unknown:
+            return matched + unknown + mismatched
+        return deduped
+
     def _ensure_player_ready(self, show_error: bool = True) -> bool:
+        if not self._player_init_attempted or not self._player_ready:
+            self._init_player()
         if self._player_available and self._player_ready and self._player is not None:
             return True
         if show_error:
-            messagebox.showerror("播放器不可用", "未检测到可用VLC播放器，请安装 VLC 并执行 pip install python-vlc")
+            extra = f"\n\n详细信息: {self._player_error_detail}" if self._player_error_detail else ""
+            messagebox.showerror(
+                "播放器不可用",
+                "未检测到可用VLC播放器，请确认已安装 VLC 桌面版并执行 pip install python-vlc。" + extra,
+            )
         return False
 
     def _load_media_for_current_task(self) -> None:
@@ -522,10 +666,26 @@ class ReviewWindow(ttk.Frame):
 
         tick()
 
+    def _schedule_heatline_redraw(self) -> None:
+        if self.heat_canvas is None or not self.winfo_exists():
+            return
+        if self._heatline_redraw_after_id is not None:
+            try:
+                self.after_cancel(self._heatline_redraw_after_id)
+            except Exception:
+                pass
+        self._heatline_redraw_after_id = self.after(40, self.draw_heatline)
+
     def _on_destroy(self, event) -> None:
         if event.widget is not self:
             return
         self._cancel_candidate_tick()
+        if self._heatline_redraw_after_id is not None:
+            try:
+                self.after_cancel(self._heatline_redraw_after_id)
+            except Exception:
+                pass
+            self._heatline_redraw_after_id = None
         if self._player_time_after_id is not None:
             try:
                 self.after_cancel(self._player_time_after_id)
@@ -547,6 +707,10 @@ class ReviewWindow(ttk.Frame):
             self._vlc_instance = None
 
     def draw_heatline(self) -> None:
+        self._heatline_redraw_after_id = None
+        if self.heat_canvas is None or not self.winfo_exists():
+            return
+
         self.heat_canvas.delete("all")
         if self.current_task_id is None:
             return
@@ -557,12 +721,6 @@ class ReviewWindow(ttk.Frame):
             return
 
         segments = self.review_service.list_window_segments(self.current_task_id, window_start, window_end)
-        if not segments:
-            self.timeline_info_var.set(
-                f"时间窗 {window_start:.0f}s - {window_end:.0f}s / 总时长 {self.total_duration_sec:.0f}s"
-            )
-            return
-
         width = max(self.heat_canvas.winfo_width(), 1)
         height = max(self.heat_canvas.winfo_height(), 1)
         axis_left = 48
@@ -570,17 +728,34 @@ class ReviewWindow(ttk.Frame):
         axis_y = height - 18
 
         self.heat_canvas.create_line(axis_left, axis_y, axis_right, axis_y, fill="#555")
-        self.heat_canvas.create_text(axis_left, axis_y + 10, text="0s", anchor="w", fill="#444")
-        self.heat_canvas.create_text(axis_right, axis_y + 10, text=f"{self.total_duration_sec:.0f}s", anchor="e", fill="#444")
+        ticks = 6
+        for i in range(ticks + 1):
+            ratio = i / ticks
+            x = axis_left + ratio * (axis_right - axis_left)
+            self.heat_canvas.create_line(x, axis_y - 3, x, axis_y + 3, fill="#666")
+            label_sec = ratio * self.total_duration_sec
+            self.heat_canvas.create_text(x, axis_y + 11, text=f"{label_sec:.0f}s", anchor="n", fill="#444")
 
         if self.total_duration_sec > 0:
             ws_x = axis_left + (window_start / self.total_duration_sec) * (axis_right - axis_left)
             we_x = axis_left + (window_end / self.total_duration_sec) * (axis_right - axis_left)
             self.heat_canvas.create_rectangle(ws_x, axis_y - 6, we_x, axis_y + 6, outline="#2196f3")
 
+            seek_x = axis_left + (self.current_seek_sec / self.total_duration_sec) * (axis_right - axis_left)
+            self.heat_canvas.create_line(seek_x, 10, seek_x, axis_y - 8, fill="#ff5722", dash=(3, 2))
+
         self.timeline_info_var.set(
             f"时间窗 {window_start:.0f}s - {window_end:.0f}s / 总时长 {self.total_duration_sec:.0f}s"
         )
+
+        if not segments:
+            self.heat_canvas.create_text(
+                (axis_left + axis_right) / 2,
+                (axis_y - 12) / 2,
+                text="当前时间窗暂无热度片段",
+                fill="#777",
+            )
+            return
 
         for segment in segments:
             if self.total_duration_sec <= 0:

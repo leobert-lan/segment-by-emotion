@@ -21,7 +21,8 @@ class MainWindow(tk.Tk):
     ) -> None:
         super().__init__()
         self.title("Segment By Motion - MVP")
-        self.geometry("1080x760")
+        self.geometry("1360x900")
+        self.minsize(1200, 780)
 
         self.task_repository = task_repository
         self.ingest_service = ingest_service
