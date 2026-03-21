@@ -19,7 +19,7 @@ class ReviewWindow(ttk.Frame):
         self.window_duration_var = tk.StringVar(value="600")
         self.window_start_var = tk.StringVar(value="0")
         self.timeline_info_var = tk.StringVar(value="时间窗 0s - 0s / 总时长 0s")
-        self.seek_info_var = tk.StringVar(value="当前定位: 0s")
+        self.seek_info_var = tk.StringVar(value="当前定位: 00:00")
 
         self.task_combo = None
         self.segments_tree = None
@@ -45,6 +45,11 @@ class ReviewWindow(ttk.Frame):
         self.video_panel = None
         self.video_status_var = tk.StringVar(value="播放器状态: 未初始化")
         self.playback_rate_var = tk.StringVar(value="1.0")
+        self.volume_var = tk.IntVar(value=70)
+
+        self._window_candidates = []
+        self._tree_sort_column = "start"
+        self._tree_sort_desc = False
 
         self._build_layout()
         self.refresh_tasks()
@@ -116,6 +121,18 @@ class ReviewWindow(ttk.Frame):
         )
         speed_box.pack(side="left")
         speed_box.bind("<<ComboboxSelected>>", lambda _event: self.apply_playback_rate())
+
+        ttk.Label(player_controls, text="音量").pack(side="left", padx=(12, 4))
+        volume_scale = ttk.Scale(
+            player_controls,
+            from_=0,
+            to=100,
+            orient="horizontal",
+            variable=self.volume_var,
+            command=self.on_volume_change,
+        )
+        volume_scale.pack(side="left", padx=(0, 4), fill="x", expand=True)
+        ttk.Label(player_controls, textvariable=self.volume_var, width=4).pack(side="left")
         ttk.Label(player_controls, textvariable=self.video_status_var).pack(side="right")
 
         timeline_wrap = ttk.LabelFrame(self, text="热度时间轴")
@@ -136,9 +153,11 @@ class ReviewWindow(ttk.Frame):
             height=12,
         )
 
-        for col, width in (("id", 60), ("start", 90), ("end", 90), ("heat", 80), ("label", 100)):
-            self.segments_tree.heading(col, text=col)
+        for col, width in (("id", 60), ("start", 130), ("end", 130), ("heat", 80), ("label", 120)):
+            self.segments_tree.heading(col, text=col, command=lambda c=col: self.on_sort_by_column(c))
             self.segments_tree.column(col, width=width, anchor="center")
+
+        self._refresh_tree_header_texts()
 
         self.segments_tree.pack(side="left", fill="both", expand=True)
         self.segments_tree.bind("<Double-1>", lambda _event: self.play_selected_segment())
@@ -165,7 +184,7 @@ class ReviewWindow(ttk.Frame):
         self.total_duration_sec = self.review_service.get_task_duration_sec(self.current_task_id)
         self.window_start_var.set("0")
         self.current_seek_sec = 0.0
-        self.seek_info_var.set("当前定位: 0s")
+        self.seek_info_var.set(f"当前定位: {self._format_time(0.0)}")
         self.stop_candidate_segments()
         self._load_media_for_current_task()
         self._schedule_heatline_redraw()
@@ -246,10 +265,6 @@ class ReviewWindow(ttk.Frame):
             messagebox.showerror("阈值错误", str(error))
             return
 
-        self.timeline_info_var.set(
-            f"时间窗 {window_start:.0f}s - {window_end:.0f}s / 总时长 {self.total_duration_sec:.0f}s"
-        )
-
         rows = self.review_service.list_window_candidates(
             self.current_task_id,
             min_t,
@@ -257,19 +272,12 @@ class ReviewWindow(ttk.Frame):
             window_start_sec=window_start,
             window_end_sec=window_end,
         )
-        self.segments_tree.delete(*self.segments_tree.get_children())
-        for segment in rows:
-            self.segments_tree.insert(
-                "",
-                "end",
-                values=(
-                    segment.id,
-                    f"{segment.start_sec:.1f}",
-                    f"{segment.end_sec:.1f}",
-                    f"{segment.heat_score:.3f}",
-                    segment.current_label or "",
-                ),
-            )
+        self._window_candidates = list(rows)
+        self._tree_sort_column = "start"
+        self._tree_sort_desc = False
+        self._refresh_tree_header_texts()
+        self._render_segments_table()
+        self._set_timeline_info(window_start, window_end)
         self._schedule_heatline_redraw()
 
     def mark_selected(self, label: str) -> None:
@@ -333,8 +341,11 @@ class ReviewWindow(ttk.Frame):
         if not selected:
             return
         values = self.segments_tree.item(selected[0], "values")
-        start_sec = float(values[1])
-        self.play_video_at(start_sec)
+        segment_id = int(values[0])
+        segment = self._find_cached_segment(segment_id)
+        if segment is None:
+            return
+        self.play_video_at(float(segment.start_sec))
 
     def play_video_at(self, seek_sec: float) -> None:
         if self.current_task_id is None or not self._ensure_player_ready():
@@ -344,8 +355,9 @@ class ReviewWindow(ttk.Frame):
         self._player.play()
         self.after(120, lambda: self._player.set_time(int(max(0.0, seek_sec) * 1000)))
         self.current_seek_sec = max(0.0, seek_sec)
-        self.seek_info_var.set(f"当前定位: {self.current_seek_sec:.1f}s")
-        self.video_status_var.set(f"播放器状态: 播放中 ({self.current_seek_sec:.1f}s)")
+        current_text = self._format_time(self.current_seek_sec, include_tenths=True)
+        self.seek_info_var.set(f"当前定位: {current_text}")
+        self.video_status_var.set(f"播放器状态: 播放中 ({current_text})")
 
     def on_click_heatline(self, event) -> None:
         if self.total_duration_sec <= 0:
@@ -356,9 +368,10 @@ class ReviewWindow(ttk.Frame):
         x = min(max(event.x, axis_left), axis_right)
         ratio = (x - axis_left) / (axis_right - axis_left)
         self.current_seek_sec = ratio * self.total_duration_sec
-        self.seek_info_var.set(f"当前定位: {self.current_seek_sec:.1f}s")
+        current_text = self._format_time(self.current_seek_sec, include_tenths=True)
+        self.seek_info_var.set(f"当前定位: {current_text}")
         if self._player_available:
-            self.video_status_var.set(f"播放器状态: 已定位到 {self.current_seek_sec:.1f}s")
+            self.video_status_var.set(f"播放器状态: 已定位到 {current_text}")
 
     def _init_player(self) -> None:
         if self._player_ready and self._player is not None:
@@ -393,6 +406,7 @@ class ReviewWindow(ttk.Frame):
             self._player_ready = True
             self._player_error_detail = ""
             self.video_status_var.set("播放器状态: 已就绪")
+            self._apply_volume()
             self._bind_player_time_update()
         except Exception as error:
             self._player_available = False
@@ -569,6 +583,23 @@ class ReviewWindow(ttk.Frame):
             return
         self._player.set_rate(rate)
 
+    def on_volume_change(self, _value=None) -> None:
+        self._apply_volume()
+
+    def _apply_volume(self) -> None:
+        if self._player is None:
+            return
+        try:
+            volume = int(self.volume_var.get())
+        except (ValueError, tk.TclError):
+            volume = 70
+        volume = max(0, min(100, volume))
+        self.volume_var.set(volume)
+        try:
+            self._player.audio_set_volume(volume)
+        except Exception:
+            pass
+
     def play_candidate_segments(self) -> None:
         if self.current_task_id is None:
             return
@@ -607,7 +638,9 @@ class ReviewWindow(ttk.Frame):
         self._player.play()
         self.after(120, lambda: self._player.set_time(int(segment.start_sec * 1000)))
         self.video_status_var.set(
-            f"播放器状态: 候选片段 {index + 1}/{len(self._candidate_segments)} ({segment.start_sec:.1f}s-{segment.end_sec:.1f}s)"
+            f"播放器状态: 候选片段 {index + 1}/{len(self._candidate_segments)} "
+            f"({self._format_time(segment.start_sec, include_tenths=True)}-"
+            f"{self._format_time(segment.end_sec, include_tenths=True)})"
         )
         self._schedule_candidate_tick()
 
@@ -661,7 +694,9 @@ class ReviewWindow(ttk.Frame):
                 current_ms = self._player.get_time()
                 if current_ms >= 0:
                     self.current_seek_sec = current_ms / 1000.0
-                    self.seek_info_var.set(f"当前定位: {self.current_seek_sec:.1f}s")
+                    self.seek_info_var.set(
+                        f"当前定位: {self._format_time(self.current_seek_sec, include_tenths=True)}"
+                    )
             self._player_time_after_id = self.after(300, tick)
 
         tick()
@@ -727,6 +762,10 @@ class ReviewWindow(ttk.Frame):
         axis_right = max(axis_left + 1, width - 16)
         axis_y = height - 18
 
+        bar_top = 14
+        bar_bottom = 26
+        self.heat_canvas.create_rectangle(axis_left, bar_top, axis_right, bar_bottom, fill="#e8e8e8", outline="")
+
         self.heat_canvas.create_line(axis_left, axis_y, axis_right, axis_y, fill="#555")
         ticks = 6
         for i in range(ticks + 1):
@@ -734,19 +773,19 @@ class ReviewWindow(ttk.Frame):
             x = axis_left + ratio * (axis_right - axis_left)
             self.heat_canvas.create_line(x, axis_y - 3, x, axis_y + 3, fill="#666")
             label_sec = ratio * self.total_duration_sec
-            self.heat_canvas.create_text(x, axis_y + 11, text=f"{label_sec:.0f}s", anchor="n", fill="#444")
+            self.heat_canvas.create_text(x, axis_y + 11, text=self._format_time(label_sec), anchor="n", fill="#444")
 
         if self.total_duration_sec > 0:
             ws_x = axis_left + (window_start / self.total_duration_sec) * (axis_right - axis_left)
             we_x = axis_left + (window_end / self.total_duration_sec) * (axis_right - axis_left)
             self.heat_canvas.create_rectangle(ws_x, axis_y - 6, we_x, axis_y + 6, outline="#2196f3")
+            self.heat_canvas.create_rectangle(ws_x, bar_top, we_x, bar_bottom, fill="#90caf9", outline="")
 
             seek_x = axis_left + (self.current_seek_sec / self.total_duration_sec) * (axis_right - axis_left)
             self.heat_canvas.create_line(seek_x, 10, seek_x, axis_y - 8, fill="#ff5722", dash=(3, 2))
+            self.heat_canvas.create_text(seek_x, 8, text=self._format_time(self.current_seek_sec), anchor="s", fill="#ff5722")
 
-        self.timeline_info_var.set(
-            f"时间窗 {window_start:.0f}s - {window_end:.0f}s / 总时长 {self.total_duration_sec:.0f}s"
-        )
+        self._set_timeline_info(window_start, window_end)
 
         if not segments:
             self.heat_canvas.create_text(
@@ -771,3 +810,84 @@ class ReviewWindow(ttk.Frame):
                 color = "#ff9800"
             self.heat_canvas.create_rectangle(x0, y0, x1, y1, fill=color, outline="")
 
+    def _find_cached_segment(self, segment_id: int):
+        for segment in self._window_candidates:
+            if segment.id == segment_id:
+                return segment
+        return None
+
+    def _set_timeline_info(self, window_start: float, window_end: float) -> None:
+        total = max(0.0, self.total_duration_sec)
+        window_len = max(0.0, window_end - window_start)
+        ratio = (window_len / total * 100.0) if total > 0 else 0.0
+        self.timeline_info_var.set(
+            f"窗口 {self._format_time(window_start)} - {self._format_time(window_end)} "
+            f"(时长 {self._format_time(window_len)}) / 总时长 {self._format_time(total)} | 覆盖 {ratio:.1f}%"
+        )
+
+    def _format_time(self, seconds: float, include_tenths: bool = False) -> str:
+        safe = max(0.0, float(seconds))
+        whole = int(safe)
+        frac = int((safe - whole) * 10)
+        hours = whole // 3600
+        minutes = (whole % 3600) // 60
+        secs = whole % 60
+        if hours > 0:
+            base = f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        else:
+            base = f"{minutes:02d}:{secs:02d}"
+        if include_tenths:
+            return f"{base}.{frac}"
+        return base
+
+    def on_sort_by_column(self, column: str) -> None:
+        if column == self._tree_sort_column:
+            self._tree_sort_desc = not self._tree_sort_desc
+        else:
+            self._tree_sort_column = column
+            self._tree_sort_desc = False
+        self._refresh_tree_header_texts()
+        self._render_segments_table()
+
+    def _refresh_tree_header_texts(self) -> None:
+        if self.segments_tree is None:
+            return
+        title_map = {
+            "id": "ID",
+            "start": "开始时间",
+            "end": "结束时间",
+            "heat": "热度",
+            "label": "标记",
+        }
+        for col, title in title_map.items():
+            arrow = ""
+            if col == self._tree_sort_column:
+                arrow = " ▼" if self._tree_sort_desc else " ▲"
+            self.segments_tree.heading(col, text=f"{title}{arrow}", command=lambda c=col: self.on_sort_by_column(c))
+
+    def _render_segments_table(self) -> None:
+        if self.segments_tree is None:
+            return
+        key_map = {
+            "id": lambda s: s.id,
+            "start": lambda s: s.start_sec,
+            "end": lambda s: s.end_sec,
+            "heat": lambda s: s.heat_score,
+            "label": lambda s: s.current_label or "",
+        }
+        sort_key = key_map.get(self._tree_sort_column, key_map["start"])
+        sorted_rows = sorted(self._window_candidates, key=sort_key, reverse=self._tree_sort_desc)
+
+        self.segments_tree.delete(*self.segments_tree.get_children())
+        for segment in sorted_rows:
+            self.segments_tree.insert(
+                "",
+                "end",
+                values=(
+                    segment.id,
+                    self._format_time(segment.start_sec, include_tenths=True),
+                    self._format_time(segment.end_sec, include_tenths=True),
+                    f"{segment.heat_score:.3f}",
+                    segment.current_label or "",
+                ),
+            )
