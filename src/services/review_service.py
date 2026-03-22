@@ -111,6 +111,15 @@ class ReviewService:
         self.task_repository.mark_label_event_undone(event["id"])
         return True
 
+    def clear_all_marks(self, task_id: int) -> int:
+        cleared_count = self.task_repository.clear_segment_labels_by_task(task_id)
+        self.task_repository.mark_task_label_events_undone(task_id)
+        if cleared_count > 0:
+            task = self.task_repository.get_task(task_id)
+            if task.status == "review_done":
+                self.task_repository.update_task_status(task_id, "review_in_progress")
+        return cleared_count
+
     def complete_review(self, task_id: int) -> None:
         self.task_repository.update_task_status(task_id, "review_done")
 
@@ -130,4 +139,44 @@ class ReviewService:
 
     def get_threshold_profile(self, speaker_id: str, profile_name: str = "default") -> Optional[ThresholdProfile]:
         return self.profile_repository.get_profile(speaker_id=speaker_id, profile_name=profile_name)
+
+    def smart_mark_segments(
+        self,
+        task_id: int,
+        base_threshold: float,
+        max_threshold: float = 1.0,
+        high_offset: float = 0.0,
+        low_offset: float = 0.05,
+    ) -> tuple[int, int, int]:
+        if not (0.0 <= base_threshold <= 1.0):
+            raise ValueError("base_threshold must be between 0 and 1")
+        if not (0.0 <= max_threshold <= 1.0):
+            raise ValueError("max_threshold must be between 0 and 1")
+        if base_threshold > max_threshold:
+            raise ValueError("base_threshold must be less than or equal to max_threshold")
+        if high_offset < 0 or low_offset < 0:
+            raise ValueError("offsets must be non-negative")
+
+        high_cutoff = min(1.0, base_threshold + high_offset)
+        low_cutoff = max(0.0, base_threshold - low_offset)
+
+        segments = self.task_repository.list_segments(task_id=task_id, include_labeled=False)
+        interesting_count = 0
+        uninteresting_count = 0
+        unchanged_count = 0
+
+        for segment in segments:
+            if segment.heat_score > max_threshold:
+                unchanged_count += 1
+                continue
+            if segment.heat_score > high_cutoff:
+                self.mark_segment(task_id, segment.id, "interesting")
+                interesting_count += 1
+            elif segment.heat_score < low_cutoff:
+                self.mark_segment(task_id, segment.id, "uninteresting")
+                uninteresting_count += 1
+            else:
+                unchanged_count += 1
+
+        return interesting_count, uninteresting_count, unchanged_count
 

@@ -101,6 +101,7 @@ class MainWindow(tk.Tk):
         scrollbar.pack(side="right", fill="y")
 
     def show_task_page(self) -> None:
+        self.review_page.stop_playback_for_navigation()
         self.review_page.pack_forget()
         self.task_page.pack(fill="both", expand=True)
 

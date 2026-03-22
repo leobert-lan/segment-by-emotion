@@ -142,6 +142,14 @@ class TaskRepository:
                 (label, segment_id),
             )
 
+    def clear_segment_labels_by_task(self, task_id: int) -> int:
+        with self.database.session() as connection:
+            cursor = connection.execute(
+                "UPDATE segments SET current_label = NULL WHERE task_id = ? AND current_label IS NOT NULL",
+                (task_id,),
+            )
+        return int(cursor.rowcount or 0)
+
     def update_segments_heat_score(self, segment_ids: list[int], new_heat_score: float) -> int:
         if not segment_ids:
             return 0
@@ -187,6 +195,14 @@ class TaskRepository:
     def mark_label_event_undone(self, event_id: int) -> None:
         with self.database.session() as connection:
             connection.execute("UPDATE label_events SET undone = 1 WHERE id = ?", (event_id,))
+
+    def mark_task_label_events_undone(self, task_id: int) -> int:
+        with self.database.session() as connection:
+            cursor = connection.execute(
+                "UPDATE label_events SET undone = 1 WHERE task_id = ? AND undone = 0",
+                (task_id,),
+            )
+        return int(cursor.rowcount or 0)
 
     def count_segments(self, task_id: int) -> int:
         with self.database.session() as connection:

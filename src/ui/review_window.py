@@ -1,6 +1,8 @@
 import tkinter as tk
 import os
 import struct
+from queue import Empty, Queue
+from threading import Thread
 from dataclasses import dataclass
 from tkinter import messagebox, ttk
 
@@ -26,6 +28,8 @@ class ReviewWindow(ttk.Frame):
         self.task_info_var = tk.StringVar(value="当前任务: 未选择")
         self.threshold_min_var = tk.StringVar(value="0.40")
         self.threshold_max_var = tk.StringVar(value="1.00")
+        self.smart_high_offset_var = tk.StringVar(value="0.00")
+        self.smart_low_offset_var = tk.StringVar(value="0.05")
         self.window_duration_var = tk.StringVar(value="20000")
         self.window_start_var = tk.StringVar(value="0")
         self.timeline_info_var = tk.StringVar(value="时间窗 0s - 0s / 总时长 0s")
@@ -75,6 +79,13 @@ class ReviewWindow(ttk.Frame):
         self._tree_sort_column = "start"
         self._tree_sort_desc = False
 
+        self.smart_mark_button: ttk.Button | None = None
+        self._smart_mark_thread: Thread | None = None
+        self._smart_mark_result_queue: Queue = Queue()
+        self._smart_mark_poll_after_id: str | None = None
+        self._smart_mark_loading_dialog: tk.Toplevel | None = None
+        self._smart_mark_loading_progress: ttk.Progressbar | None = None
+
         self._build_layout()
         self.bind("<Destroy>", self._on_destroy, add="+")
 
@@ -86,7 +97,7 @@ class ReviewWindow(ttk.Frame):
         task_row.pack(fill="x", padx=8, pady=(6, 4))
         ttk.Label(task_row, textvariable=self.task_info_var).pack(side="left")
         if self.on_back_to_tasks is not None:
-            ttk.Button(task_row, text="返回任务管理", command=self.on_back_to_tasks).pack(side="right")
+            ttk.Button(task_row, text="返回任务管理", command=self.on_back_to_tasks_clicked).pack(side="right")
 
         window_row = ttk.Frame(controls)
         window_row.pack(fill="x", padx=8, pady=4)
@@ -104,12 +115,19 @@ class ReviewWindow(ttk.Frame):
         ttk.Entry(threshold_row, textvariable=self.threshold_min_var, width=8).pack(side="left", padx=(4, 12))
         ttk.Label(threshold_row, text="阈值最大").pack(side="left")
         ttk.Entry(threshold_row, textvariable=self.threshold_max_var, width=8).pack(side="left", padx=4)
+        ttk.Label(threshold_row, text="智能有趣偏移").pack(side="left", padx=(12, 2))
+        ttk.Entry(threshold_row, textvariable=self.smart_high_offset_var, width=6).pack(side="left", padx=(0, 8))
+        ttk.Label(threshold_row, text="智能无趣偏移").pack(side="left", padx=(0, 2))
+        ttk.Entry(threshold_row, textvariable=self.smart_low_offset_var, width=6).pack(side="left", padx=(0, 8))
         ttk.Button(threshold_row, text="应用筛选", command=self.refresh_candidates).pack(side="left", padx=(8, 4))
         ttk.Button(threshold_row, text="加载说话人档案", command=self.load_profile).pack(side="left", padx=4)
         ttk.Button(threshold_row, text="保存说话人档案", command=self.save_profile).pack(side="left", padx=4)
 
         action_row = ttk.Frame(controls)
         action_row.pack(fill="x", padx=8, pady=(4, 8))
+        self.smart_mark_button = ttk.Button(action_row, text="智能标记", command=self.smart_mark)
+        self.smart_mark_button.pack(side="left", padx=4)
+        ttk.Button(action_row, text="清除所有标记", command=self.clear_all_marks).pack(side="left", padx=4)
         ttk.Button(action_row, text="标记有趣 (I)", command=lambda: self.mark_selected("interesting")).pack(side="left", padx=4)
         ttk.Button(action_row, text="标记无趣 (U)", command=lambda: self.mark_selected("uninteresting")).pack(side="left", padx=4)
         ttk.Button(action_row, text="撤销上次标记", command=self.undo_last).pack(side="left", padx=4)
@@ -345,6 +363,131 @@ class ReviewWindow(ttk.Frame):
         self.refresh_candidates()
         self._schedule_heatline_redraw()
         self.on_task_refresh()
+
+    def smart_mark(self) -> None:
+        if self._smart_mark_thread is not None and self._smart_mark_thread.is_alive():
+            messagebox.showinfo("处理中", "智能标记正在执行，请稍候")
+            return
+        if self.current_task_id is None:
+            return
+        try:
+            min_t, max_t = self.get_thresholds()
+            high_offset = float(self.smart_high_offset_var.get())
+            low_offset = float(self.smart_low_offset_var.get())
+        except ValueError as error:
+            messagebox.showerror("参数错误", str(error))
+            return
+        if high_offset < 0 or low_offset < 0:
+            messagebox.showerror("参数错误", "智能偏移必须是非负数")
+            return
+
+        task_id = self.current_task_id
+        self._show_smart_mark_loading("正在智能标记，请稍候...")
+        self._set_smart_mark_enabled(False)
+
+        def worker() -> None:
+            try:
+                result = self.review_service.smart_mark_segments(
+                    task_id,
+                    base_threshold=min_t,
+                    max_threshold=max_t,
+                    high_offset=high_offset,
+                    low_offset=low_offset,
+                )
+                self._smart_mark_result_queue.put(("ok", task_id, result))
+            except Exception as exc:
+                self._smart_mark_result_queue.put(("error", task_id, exc))
+
+        self._smart_mark_thread = Thread(target=worker, daemon=True)
+        self._smart_mark_thread.start()
+        self._poll_smart_mark_result()
+
+    def _poll_smart_mark_result(self) -> None:
+        try:
+            status, task_id, payload = self._smart_mark_result_queue.get_nowait()
+        except Empty:
+            self._smart_mark_poll_after_id = self.after(150, self._poll_smart_mark_result)
+            return
+
+        self._smart_mark_poll_after_id = None
+        self._smart_mark_thread = None
+        self._hide_smart_mark_loading()
+        self._set_smart_mark_enabled(True)
+
+        if self.current_task_id != task_id:
+            return
+
+        if status == "ok":
+            interesting_count, uninteresting_count, unchanged_count = payload
+            self.refresh_candidates()
+            self._schedule_heatline_redraw()
+            self.on_task_refresh()
+            messagebox.showinfo(
+                "智能标记完成",
+                (
+                    f"有趣: {interesting_count} 条\n"
+                    f"无趣: {uninteresting_count} 条\n"
+                    f"保持不变: {unchanged_count} 条"
+                ),
+            )
+            return
+
+        messagebox.showerror("智能标记失败", str(payload))
+
+    def clear_all_marks(self) -> None:
+        if self.current_task_id is None:
+            return
+        if not messagebox.askyesno("确认", "确认清除该任务的全部标记吗？"):
+            return
+
+        cleared_count = self.review_service.clear_all_marks(self.current_task_id)
+        self.refresh_candidates()
+        self._schedule_heatline_redraw()
+        self.on_task_refresh()
+        messagebox.showinfo("已完成", f"已清除 {cleared_count} 条标记")
+
+    def on_back_to_tasks_clicked(self) -> None:
+        self.stop_playback_for_navigation()
+        if self.on_back_to_tasks is not None:
+            self.on_back_to_tasks()
+
+    def _show_smart_mark_loading(self, text: str) -> None:
+        if self._smart_mark_loading_dialog is not None and self._smart_mark_loading_dialog.winfo_exists():
+            return
+
+        dialog = tk.Toplevel(self)
+        dialog.title("处理中")
+        dialog.geometry("380x120")
+        dialog.transient(self.winfo_toplevel())
+        dialog.resizable(False, False)
+        dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text=text).pack(fill="x", pady=(0, 10))
+
+        progress = ttk.Progressbar(frame, mode="indeterminate", length=320)
+        progress.pack(fill="x")
+        progress.start(10)
+
+        dialog.grab_set()
+        self._smart_mark_loading_dialog = dialog
+        self._smart_mark_loading_progress = progress
+
+    def _hide_smart_mark_loading(self) -> None:
+        if self._smart_mark_loading_progress is not None:
+            self._smart_mark_loading_progress.stop()
+        self._smart_mark_loading_progress = None
+
+        if self._smart_mark_loading_dialog is not None and self._smart_mark_loading_dialog.winfo_exists():
+            self._smart_mark_loading_dialog.grab_release()
+            self._smart_mark_loading_dialog.destroy()
+        self._smart_mark_loading_dialog = None
+
+    def _set_smart_mark_enabled(self, enabled: bool) -> None:
+        if self.smart_mark_button is None:
+            return
+        self.smart_mark_button.config(state="normal" if enabled else "disabled")
 
     def undo_last(self) -> None:
         if self.current_task_id is None:
@@ -761,6 +904,18 @@ class ReviewWindow(ttk.Frame):
         self._player.stop()
         self.video_status_var.set("播放器状态: 停止")
 
+    def stop_playback_for_navigation(self) -> None:
+        self.candidate_loop_var.set(False)
+        self.stop_candidate_segments(show_message=False)
+        if self._player is None:
+            self.video_status_var.set("播放器状态: 停止")
+            return
+        try:
+            self._player.stop()
+        except Exception:
+            pass
+        self.video_status_var.set("播放器状态: 停止")
+
     def apply_playback_rate(self) -> None:
         if not self._ensure_player_ready():
             return
@@ -916,6 +1071,13 @@ class ReviewWindow(ttk.Frame):
     def _on_destroy(self, event) -> None:
         if event.widget is not self:
             return
+        if self._smart_mark_poll_after_id is not None:
+            try:
+                self.after_cancel(self._smart_mark_poll_after_id)
+            except Exception:
+                pass
+            self._smart_mark_poll_after_id = None
+        self._hide_smart_mark_loading()
         self._cancel_candidate_tick()
         if self._heatline_redraw_after_id is not None:
             try:
