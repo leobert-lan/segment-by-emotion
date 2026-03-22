@@ -30,14 +30,20 @@ class MainWindow(tk.Tk):
         self.stage3_stub = stage3_stub
 
         self.video_path_var = tk.StringVar()
+        self.import_dir_var = tk.StringVar()
         self.speaker_id_var = tk.StringVar(value="speaker_001")
+        self.batch_generate_heat_var = tk.BooleanVar(value=True)
         self.create_task_button: ttk.Button | None = None
+        self.batch_import_button: ttk.Button | None = None
 
         self.loading_dialog: tk.Toplevel | None = None
         self.loading_progress: ttk.Progressbar | None = None
         self._create_task_thread: Thread | None = None
         self._create_task_result_queue: Queue = Queue()
         self._create_task_poll_after_id: str | None = None
+        self._batch_import_thread: Thread | None = None
+        self._batch_import_result_queue: Queue = Queue()
+        self._batch_import_poll_after_id: str | None = None
 
         self.tasks_tree: ttk.Treeview | None = None
 
@@ -66,16 +72,23 @@ class MainWindow(tk.Tk):
         ttk.Label(top, text="视频文件").grid(row=0, column=0, sticky="w")
         ttk.Entry(top, textvariable=self.video_path_var, width=80).grid(row=0, column=1, padx=6, sticky="ew")
         ttk.Button(top, text="浏览", command=self.pick_video).grid(row=0, column=2, padx=4)
+        self.create_task_button = ttk.Button(top, text="创建单个任务并计算热度", command=self.create_task)
+        self.create_task_button.grid(row=0, column=3, padx=4)
 
-        ttk.Label(top, text="说话人ID").grid(row=1, column=0, sticky="w", pady=6)
-        ttk.Entry(top, textvariable=self.speaker_id_var, width=20).grid(row=1, column=1, sticky="w", padx=6)
+        ttk.Label(top, text="批量目录").grid(row=1, column=0, sticky="w", pady=6)
+        ttk.Entry(top, textvariable=self.import_dir_var, width=80).grid(row=1, column=1, padx=6, sticky="ew")
+        ttk.Button(top, text="选择目录", command=self.pick_import_directory).grid(row=1, column=2, padx=4)
+        ttk.Checkbutton(top, text="导入后生成热度", variable=self.batch_generate_heat_var).grid(row=1, column=3, padx=4, sticky="w")
 
-        self.create_task_button = ttk.Button(top, text="创建任务并计算热度", command=self.create_task)
-        self.create_task_button.grid(row=1, column=2, padx=4)
-        ttk.Button(top, text="刷新列表", command=self.refresh_tasks).grid(row=1, column=3, padx=4)
-        ttk.Button(top, text="删除所选任务", command=self.delete_selected_task).grid(row=1, column=4, padx=4)
-        ttk.Button(top, text="发送到第三阶段(Stub)", command=self.send_to_stage3).grid(row=1, column=5, padx=4)
-        ttk.Label(top, text="提示: 双击任务进入 Review").grid(row=2, column=1, columnspan=5, sticky="w", padx=6, pady=(2, 0))
+        ttk.Label(top, text="说话人ID").grid(row=2, column=0, sticky="w", pady=6)
+        ttk.Entry(top, textvariable=self.speaker_id_var, width=20).grid(row=2, column=1, sticky="w", padx=6)
+
+        self.batch_import_button = ttk.Button(top, text="批量导入目录", command=self.batch_import_directory)
+        self.batch_import_button.grid(row=2, column=2, padx=4)
+        ttk.Button(top, text="刷新列表", command=self.refresh_tasks).grid(row=2, column=3, padx=4)
+        ttk.Button(top, text="删除所选任务", command=self.delete_selected_task).grid(row=2, column=4, padx=4)
+        ttk.Button(top, text="发送到第三阶段(Stub)", command=self.send_to_stage3).grid(row=2, column=5, padx=4)
+        ttk.Label(top, text="提示: 双击任务进入 Review").grid(row=3, column=1, columnspan=5, sticky="w", padx=6, pady=(2, 0))
 
         top.columnconfigure(1, weight=1)
 
@@ -118,8 +131,15 @@ class MainWindow(tk.Tk):
         if path:
             self.video_path_var.set(path)
 
+    def pick_import_directory(self) -> None:
+        path = filedialog.askdirectory(title="选择批量导入目录")
+        if path:
+            self.import_dir_var.set(path)
+
     def create_task(self) -> None:
-        if self._create_task_thread is not None and self._create_task_thread.is_alive():
+        if (self._create_task_thread is not None and self._create_task_thread.is_alive()) or (
+            self._batch_import_thread is not None and self._batch_import_thread.is_alive()
+        ):
             messagebox.showinfo("任务进行中", "当前正在计算热度，请等待完成")
             return
 
@@ -136,7 +156,7 @@ class MainWindow(tk.Tk):
             return
 
         self._show_loading("正在提取音频并计算热度，请稍候...")
-        self._set_create_task_enabled(False)
+        self._set_action_buttons_enabled(False)
 
         def worker() -> None:
             try:
@@ -149,6 +169,45 @@ class MainWindow(tk.Tk):
         self._create_task_thread.start()
         self._poll_create_task_result()
 
+    def batch_import_directory(self) -> None:
+        if (self._create_task_thread is not None and self._create_task_thread.is_alive()) or (
+            self._batch_import_thread is not None and self._batch_import_thread.is_alive()
+        ):
+            messagebox.showinfo("任务进行中", "已有导入或计算任务在执行，请稍候")
+            return
+
+        directory_path = self.import_dir_var.get().strip()
+        speaker_id = self.speaker_id_var.get().strip()
+        if not directory_path:
+            messagebox.showerror("参数错误", "请先选择批量导入目录")
+            return
+        if not speaker_id:
+            messagebox.showerror("参数错误", "请填写说话人ID")
+            return
+        if not Path(directory_path).exists():
+            messagebox.showerror("目录不存在", directory_path)
+            return
+
+        generate_heat_data = bool(self.batch_generate_heat_var.get())
+        loading_text = "正在批量导入并计算热度，请稍候..." if generate_heat_data else "正在批量导入任务，请稍候..."
+        self._show_loading(loading_text)
+        self._set_action_buttons_enabled(False)
+
+        def worker() -> None:
+            try:
+                result = self.ingest_service.batch_import_directory(
+                    directory_path=directory_path,
+                    speaker_id=speaker_id,
+                    generate_heat_data=generate_heat_data,
+                )
+                self._batch_import_result_queue.put(("ok", result))
+            except Exception as exc:
+                self._batch_import_result_queue.put(("error", exc))
+
+        self._batch_import_thread = Thread(target=worker, daemon=True)
+        self._batch_import_thread.start()
+        self._poll_batch_import_result()
+
     def _poll_create_task_result(self) -> None:
         try:
             status, payload = self._create_task_result_queue.get_nowait()
@@ -159,7 +218,7 @@ class MainWindow(tk.Tk):
         self._create_task_poll_after_id = None
         self._create_task_thread = None
         self._hide_loading()
-        self._set_create_task_enabled(True)
+        self._set_action_buttons_enabled(True)
 
         if status == "ok":
             task = payload
@@ -168,6 +227,39 @@ class MainWindow(tk.Tk):
             return
 
         messagebox.showerror("计算失败", f"创建任务失败：{payload}")
+
+    def _poll_batch_import_result(self) -> None:
+        try:
+            status, payload = self._batch_import_result_queue.get_nowait()
+        except Empty:
+            self._batch_import_poll_after_id = self.after(150, self._poll_batch_import_result)
+            return
+
+        self._batch_import_poll_after_id = None
+        self._batch_import_thread = None
+        self._hide_loading()
+        self._set_action_buttons_enabled(True)
+
+        if status == "ok":
+            result = payload
+            self.refresh_tasks()
+            failure_lines = [f"- {path}: {reason}" for path, reason in result.failed[:5]]
+            failure_text = "\n".join(failure_lines)
+            suffix = ""
+            if result.failed:
+                suffix = f"\n失败 {len(result.failed)} 个:\n{failure_text}"
+            messagebox.showinfo(
+                "批量导入完成",
+                (
+                    f"扫描视频: {result.scanned_count} 个\n"
+                    f"成功导入: {result.imported_count} 个\n"
+                    f"已生成热度: {result.heat_generated_count} 个"
+                    f"{suffix}"
+                ),
+            )
+            return
+
+        messagebox.showerror("批量导入失败", str(payload))
 
     def _show_loading(self, text: str) -> None:
         if self.loading_dialog is not None and self.loading_dialog.winfo_exists():
@@ -202,11 +294,12 @@ class MainWindow(tk.Tk):
             self.loading_dialog.destroy()
         self.loading_dialog = None
 
-    def _set_create_task_enabled(self, enabled: bool) -> None:
-        if self.create_task_button is None:
-            return
+    def _set_action_buttons_enabled(self, enabled: bool) -> None:
         state = "normal" if enabled else "disabled"
-        self.create_task_button.config(state=state)
+        if self.create_task_button is not None:
+            self.create_task_button.config(state=state)
+        if self.batch_import_button is not None:
+            self.batch_import_button.config(state=state)
 
     def refresh_tasks(self) -> None:
         if self.tasks_tree is None:
@@ -264,6 +357,9 @@ class MainWindow(tk.Tk):
         if self._create_task_poll_after_id is not None:
             self.after_cancel(self._create_task_poll_after_id)
             self._create_task_poll_after_id = None
+        if self._batch_import_poll_after_id is not None:
+            self.after_cancel(self._batch_import_poll_after_id)
+            self._batch_import_poll_after_id = None
         self._hide_loading()
         self.destroy()
 

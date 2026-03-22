@@ -1,10 +1,11 @@
 import tkinter as tk
 import os
 import struct
+from pathlib import Path
 from queue import Empty, Queue
 from threading import Thread
 from dataclasses import dataclass
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 from src.services.review_service import ReviewService
 
@@ -132,6 +133,7 @@ class ReviewWindow(ttk.Frame):
         ttk.Button(action_row, text="标记无趣 (U)", command=lambda: self.mark_selected("uninteresting")).pack(side="left", padx=4)
         ttk.Button(action_row, text="撤销上次标记", command=self.undo_last).pack(side="left", padx=4)
         ttk.Button(action_row, text="完成Review", command=self.complete_review).pack(side="left", padx=4)
+        ttk.Button(action_row, text="导出热度(JSON+CSV)", command=self.export_heat_data).pack(side="left", padx=4)
         ttk.Separator(action_row, orient="vertical").pack(side="left", fill="y", padx=8)
         ttk.Button(action_row, text="加载当前视频", command=self._load_media_for_current_task).pack(side="left", padx=4)
         ttk.Button(action_row, text="从当前定位播放", command=self.play_from_current_seek).pack(side="left", padx=4)
@@ -507,6 +509,29 @@ class ReviewWindow(ttk.Frame):
         task = self.review_service.get_task(self.current_task_id)
         self.task_info_var.set(
             f"当前任务: #{task.id} | {task.video_name} | {task.speaker_id} | {task.status}"
+        )
+
+    def export_heat_data(self) -> None:
+        if self.current_task_id is None:
+            return
+        output_dir = filedialog.askdirectory(title="选择导出目录")
+        if not output_dir:
+            return
+        try:
+            json_path, csv_path, segment_count = self.review_service.export_heat_data(
+                self.current_task_id,
+                Path(output_dir),
+            )
+        except Exception as exc:
+            messagebox.showerror("导出失败", str(exc))
+            return
+        messagebox.showinfo(
+            "导出完成",
+            (
+                f"已导出 {segment_count} 条分段\n"
+                f"JSON: {json_path}\n"
+                f"CSV: {csv_path}"
+            ),
         )
 
     def save_profile(self) -> None:

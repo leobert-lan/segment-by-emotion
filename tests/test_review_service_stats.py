@@ -1,3 +1,5 @@
+import csv
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -237,6 +239,41 @@ class ReviewServiceStatsTest(unittest.TestCase):
             self.assertIsNone(labels[0.76])
             self.assertEqual(labels[0.66], "interesting")
             self.assertEqual(labels[0.50], "uninteresting")
+
+    def test_export_heat_data_writes_json_and_csv(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db_path = root / "test.db"
+            export_dir = root / "exports"
+            schema_path = Path(__file__).resolve().parents[1] / "src" / "infra" / "schema.sql"
+
+            database = Database(db_path)
+            database.initialize(schema_path)
+            task_repo = TaskRepository(database)
+            profile_repo = SpeakerProfileRepository(database)
+            review = ReviewService(task_repo, profile_repo)
+
+            task = task_repo.create_task("demo.mp4", "speaker_a", segment_duration=2.0)
+            task_repo.insert_segments(task.id, [(0.0, 2.0, 0.61), (2.0, 4.0, 0.34)])
+            first_segment = task_repo.list_segments(task.id, include_labeled=True)[0]
+            review.mark_segment(task.id, first_segment.id, "interesting")
+
+            json_path, csv_path, segment_count = review.export_heat_data(task.id, export_dir)
+
+            self.assertEqual(segment_count, 2)
+            self.assertTrue(json_path.exists())
+            self.assertTrue(csv_path.exists())
+
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["task"]["id"], task.id)
+            self.assertEqual(len(payload["segments"]), 2)
+            self.assertGreaterEqual(len(payload["label_events"]), 1)
+
+            with csv_path.open("r", encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0]["task_id"], str(task.id))
+            self.assertIn("heat_score", rows[0])
 
 
 if __name__ == "__main__":

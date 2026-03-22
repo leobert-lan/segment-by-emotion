@@ -1,3 +1,7 @@
+import csv
+import json
+import re
+from pathlib import Path
 from typing import Optional
 
 from src.domain.models import Segment, Task, ThresholdProfile
@@ -179,4 +183,83 @@ class ReviewService:
                 unchanged_count += 1
 
         return interesting_count, uninteresting_count, unchanged_count
+
+    def export_heat_data(self, task_id: int, output_dir: Path) -> tuple[Path, Path, int]:
+        task = self.task_repository.get_task(task_id)
+        segments = self.task_repository.list_segments(task_id=task_id, include_labeled=True)
+        events = self.task_repository.list_label_events(task_id)
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        base_name = self._safe_export_name(f"{task.video_name}_task{task.id}")
+        json_path = output_dir / f"{base_name}_heat.json"
+        csv_path = output_dir / f"{base_name}_heat.csv"
+
+        payload = {
+            "task": {
+                "id": task.id,
+                "video_path": task.video_path,
+                "video_name": task.video_name,
+                "speaker_id": task.speaker_id,
+                "status": task.status,
+                "segment_duration": task.segment_duration,
+                "created_at": task.created_at.isoformat(),
+                "updated_at": task.updated_at.isoformat(),
+            },
+            "summary": {
+                "segment_count": len(segments),
+                "interesting_count": sum(1 for segment in segments if segment.current_label == "interesting"),
+                "uninteresting_count": sum(1 for segment in segments if segment.current_label == "uninteresting"),
+            },
+            "segments": [
+                {
+                    "id": segment.id,
+                    "start_sec": segment.start_sec,
+                    "end_sec": segment.end_sec,
+                    "duration_sec": max(0.0, segment.end_sec - segment.start_sec),
+                    "heat_score": segment.heat_score,
+                    "current_label": segment.current_label,
+                }
+                for segment in segments
+            ],
+            "label_events": events,
+        }
+        json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+        with csv_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=[
+                    "task_id",
+                    "video_name",
+                    "speaker_id",
+                    "segment_id",
+                    "start_sec",
+                    "end_sec",
+                    "duration_sec",
+                    "heat_score",
+                    "current_label",
+                ],
+            )
+            writer.writeheader()
+            for segment in segments:
+                writer.writerow(
+                    {
+                        "task_id": task.id,
+                        "video_name": task.video_name,
+                        "speaker_id": task.speaker_id,
+                        "segment_id": segment.id,
+                        "start_sec": f"{segment.start_sec:.6f}",
+                        "end_sec": f"{segment.end_sec:.6f}",
+                        "duration_sec": f"{max(0.0, segment.end_sec - segment.start_sec):.6f}",
+                        "heat_score": f"{segment.heat_score:.6f}",
+                        "current_label": segment.current_label or "",
+                    }
+                )
+
+        return json_path, csv_path, len(segments)
+
+    @staticmethod
+    def _safe_export_name(value: str) -> str:
+        sanitized = re.sub(r"[^A-Za-z0-9._-]", "_", value)
+        return sanitized.strip("._") or "task_export"
 

@@ -204,6 +204,19 @@ class TaskRepository:
             )
         return int(cursor.rowcount or 0)
 
+    def list_label_events(self, task_id: int) -> list[dict]:
+        with self.database.session() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, task_id, segment_id, previous_label, new_label, undone, created_at
+                FROM label_events
+                WHERE task_id = ?
+                ORDER BY id ASC
+                """,
+                (task_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def count_segments(self, task_id: int) -> int:
         with self.database.session() as connection:
             row = connection.execute("SELECT COUNT(*) AS cnt FROM segments WHERE task_id = ?", (task_id,)).fetchone()
