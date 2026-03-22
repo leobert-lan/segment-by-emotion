@@ -17,12 +17,18 @@ class HeatAnalyzer:
         regularize_max_gap_segments: int = 1,
         regularize_max_spike_segments: int = 1,
         regularize_sigma_factor: float = 1.0,
+        contextual_window_size: int = 7,
+        contextual_high_count: int = 3,
+        contextual_percentile: float = 0.70,
     ) -> None:
         self.target_sr = target_sr
         self.regularize_window_size = max(3, int(regularize_window_size))
         self.regularize_max_gap_segments = max(0, int(regularize_max_gap_segments))
         self.regularize_max_spike_segments = max(0, int(regularize_max_spike_segments))
         self.regularize_sigma_factor = max(0.0, float(regularize_sigma_factor))
+        self.contextual_window_size = max(3, int(contextual_window_size))
+        self.contextual_high_count = max(1, int(contextual_high_count))
+        self.contextual_percentile = max(0.05, min(0.95, float(contextual_percentile)))
 
     def estimate_duration_sec(self, video_path: str) -> float:
         audio, sample_rate = self._try_load_audio(video_path)
@@ -256,6 +262,7 @@ class HeatAnalyzer:
             scores.append(max(0.0, min(1.0, 0.6 * raw_score + 0.4 * sigmoid_score)))
 
         scores = self._smooth_scores(scores)
+        scores = self._contextual_nonlinear_adjust_scores(scores)
         scores = self._temporal_regularize_scores(scores)
         scores = self._smooth_scores(scores)
 
@@ -313,6 +320,66 @@ class HeatAnalyzer:
             right = scores[index + 1] if index < len(scores) - 1 else score
             smoothed.append(max(0.0, min(1.0, 0.2 * left + 0.6 * score + 0.2 * right)))
         return smoothed
+
+    def _contextual_nonlinear_adjust_scores(self, scores: list[float]) -> list[float]:
+        if len(scores) < 3:
+            return scores
+
+        threshold = self._percentile(scores, self.contextual_percentile)
+        adjusted = list(scores)
+        half_window = max(1, self.contextual_window_size // 2)
+
+        for index, current in enumerate(scores):
+            left = max(0, index - half_window)
+            right = min(len(scores), index + half_window + 1)
+            window = scores[left:right]
+            if not window:
+                continue
+
+            high_positions = [j for j in range(left, right) if scores[j] >= threshold]
+            high_count = len(high_positions)
+
+            if high_count == 0:
+                depth = max(0.0, threshold - current)
+                depth_ratio = min(1.0, depth / max(threshold, 1e-6))
+                penalty = 0.10 * (depth_ratio**1.4)
+                adjusted[index] = max(0.0, current - penalty)
+                continue
+
+            if high_count < self.contextual_high_count:
+                continue
+
+            support_denominator = max(1, len(window) - self.contextual_high_count + 1)
+            support_ratio = min(1.0, (high_count - self.contextual_high_count + 1) / support_denominator)
+            has_left_support = any(pos < index for pos in high_positions)
+            has_right_support = any(pos > index for pos in high_positions)
+            side_factor = 1.25 if has_left_support and has_right_support else 1.10
+
+            if current >= threshold:
+                over_ratio = min(1.0, (current - threshold) / max(1.0 - threshold, 1e-6))
+                boost = 0.10 * support_ratio * side_factor * (0.65 + 0.35 * (over_ratio**0.7))
+            else:
+                near_ratio = max(0.0, 1.0 - (threshold - current) / max(0.25, threshold * 0.6))
+                boost = 0.07 * support_ratio * side_factor * (near_ratio**1.6)
+
+            adjusted[index] = min(1.0, current + boost)
+
+        return [max(0.0, min(1.0, value)) for value in adjusted]
+
+    def _percentile(self, values: list[float], q: float) -> float:
+        if not values:
+            return 0.0
+        if len(values) == 1:
+            return float(values[0])
+
+        sorted_values = sorted(values)
+        rank = max(0.0, min(1.0, q)) * (len(sorted_values) - 1)
+        lower = int(math.floor(rank))
+        upper = int(math.ceil(rank))
+        if lower == upper:
+            return float(sorted_values[lower])
+        weight = rank - lower
+        return float(sorted_values[lower] * (1.0 - weight) + sorted_values[upper] * weight)
 
     def _temporal_regularize_scores(self, scores: list[float]) -> list[float]:
         if len(scores) < 5:

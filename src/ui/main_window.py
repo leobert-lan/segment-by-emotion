@@ -39,12 +39,7 @@ class MainWindow(tk.Tk):
         self._create_task_result_queue: Queue = Queue()
         self._create_task_poll_after_id: str | None = None
 
-        self.tasks_tree = ttk.Treeview(
-            self,
-            columns=("id", "video", "speaker", "status", "segments"),
-            show="headings",
-            height=12,
-        )
+        self.tasks_tree: ttk.Treeview | None = None
 
         self.page_container = ttk.Frame(self)
         self.page_container.pack(fill="both", expand=True)
@@ -80,12 +75,19 @@ class MainWindow(tk.Tk):
         ttk.Button(top, text="刷新列表", command=self.refresh_tasks).grid(row=1, column=3, padx=4)
         ttk.Button(top, text="删除所选任务", command=self.delete_selected_task).grid(row=1, column=4, padx=4)
         ttk.Button(top, text="发送到第三阶段(Stub)", command=self.send_to_stage3).grid(row=1, column=5, padx=4)
-        ttk.Label(top, text="提示: 双击任务进入 Review").grid(row=2, column=1, columnspan=4, sticky="w", padx=6, pady=(4, 0))
+        ttk.Label(top, text="提示: 双击任务进入 Review").grid(row=2, column=1, columnspan=5, sticky="w", padx=6, pady=(2, 0))
 
         top.columnconfigure(1, weight=1)
 
         table_wrap = ttk.Frame(self.task_page)
-        table_wrap.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        table_wrap.pack(fill="both", expand=True, padx=12, pady=(4, 12))
+
+        self.tasks_tree = ttk.Treeview(
+            table_wrap,
+            columns=("id", "video", "speaker", "status", "segments"),
+            show="headings",
+            height=12,
+        )
 
         for col, width in (("id", 60), ("video", 420), ("speaker", 120), ("status", 150), ("segments", 100)):
             self.tasks_tree.heading(col, text=col)
@@ -206,6 +208,8 @@ class MainWindow(tk.Tk):
         self.create_task_button.config(state=state)
 
     def refresh_tasks(self) -> None:
+        if self.tasks_tree is None:
+            return
         self.tasks_tree.delete(*self.tasks_tree.get_children())
         for task in self.task_repository.list_tasks():
             segment_count = self.task_repository.count_segments(task.id)
@@ -216,6 +220,8 @@ class MainWindow(tk.Tk):
             )
 
     def selected_task_id(self) -> int | None:
+        if self.tasks_tree is None:
+            return None
         selected = self.tasks_tree.selection()
         if not selected:
             return None

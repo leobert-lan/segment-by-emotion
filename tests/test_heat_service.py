@@ -95,6 +95,35 @@ class HeatAnalyzerTest(unittest.TestCase):
         self.assertLessEqual(regularized[3], 0.35)
         self.assertLessEqual(regularized[4], 0.35)
 
+    def test_contextual_adjustment_suppresses_all_low_window(self) -> None:
+        analyzer = HeatAnalyzer(contextual_window_size=5, contextual_percentile=0.70)
+
+        scores = [0.10, 0.12, 0.14, 0.16, 0.78, 0.82, 0.85]
+        adjusted = analyzer._contextual_nonlinear_adjust_scores(scores)
+
+        self.assertLess(adjusted[0], scores[0])
+        self.assertLess(adjusted[1], scores[1])
+
+    def test_contextual_adjustment_boosts_dense_high_window(self) -> None:
+        analyzer = HeatAnalyzer(contextual_window_size=7, contextual_high_count=3, contextual_percentile=0.60)
+
+        scores = [0.18, 0.42, 0.70, 0.78, 0.74, 0.66, 0.36]
+        adjusted = analyzer._contextual_nonlinear_adjust_scores(scores)
+
+        self.assertGreater(adjusted[3], scores[3])
+        self.assertGreater(adjusted[2], scores[2])
+        self.assertGreater(adjusted[5], scores[5])
+
+    def test_contextual_adjustment_two_side_support_is_stronger(self) -> None:
+        analyzer = HeatAnalyzer(contextual_window_size=7, contextual_high_count=3, contextual_percentile=0.60)
+
+        scores = [0.20, 0.61, 0.74, 0.63, 0.72, 0.68, 0.25]
+        adjusted = analyzer._contextual_nonlinear_adjust_scores(scores)
+
+        single_side_gain = adjusted[1] - scores[1]
+        two_side_gain = adjusted[3] - scores[3]
+        self.assertGreater(two_side_gain, single_side_gain)
+
     def _write_demo_wav(self, output_path: Path, sample_rate: int = 16000) -> None:
         duration_sec = 6
         total_samples = sample_rate * duration_sec
