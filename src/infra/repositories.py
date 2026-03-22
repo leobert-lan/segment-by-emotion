@@ -44,6 +44,11 @@ class TaskRepository:
                 (status, now, task_id),
             )
 
+    def delete_task(self, task_id: int) -> int:
+        with self.database.session() as connection:
+            cursor = connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        return int(cursor.rowcount or 0)
+
     def insert_segments(self, task_id: int, segments: Iterable[tuple[float, float, float]]) -> None:
         with self.database.session() as connection:
             connection.executemany(

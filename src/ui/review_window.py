@@ -16,13 +16,14 @@ class TrackItem:
 
 
 class ReviewWindow(ttk.Frame):
-    def __init__(self, master: tk.Widget, review_service: ReviewService, on_task_refresh) -> None:
+    def __init__(self, master: tk.Widget, review_service: ReviewService, on_task_refresh, on_back_to_tasks=None) -> None:
         super().__init__(master)
         self.review_service = review_service
         self.on_task_refresh = on_task_refresh
+        self.on_back_to_tasks = on_back_to_tasks
         self.current_task_id: int | None = None
 
-        self.task_var = tk.StringVar()
+        self.task_info_var = tk.StringVar(value="当前任务: 未选择")
         self.threshold_min_var = tk.StringVar(value="0.40")
         self.threshold_max_var = tk.StringVar(value="1.00")
         self.window_duration_var = tk.StringVar(value="20000")
@@ -32,7 +33,6 @@ class ReviewWindow(ttk.Frame):
         self.seek_info_var = tk.StringVar(value="当前定位: 00:00")
         self.edit_state_var = tk.StringVar(value="编辑: 未启用")
 
-        self.task_combo = None
         self.segments_tree = None
         self.heat_canvas = None
         self.local_progress_canvas = None
@@ -76,19 +76,17 @@ class ReviewWindow(ttk.Frame):
         self._tree_sort_desc = False
 
         self._build_layout()
-        self.refresh_tasks()
         self.bind("<Destroy>", self._on_destroy, add="+")
 
     def _build_layout(self) -> None:
-        controls = ttk.LabelFrame(self, text="任务与筛选")
+        controls = ttk.LabelFrame(self, text="筛选与操作")
         controls.pack(fill="x", padx=10, pady=8)
 
         task_row = ttk.Frame(controls)
         task_row.pack(fill="x", padx=8, pady=(6, 4))
-        ttk.Label(task_row, text="任务").pack(side="left")
-        self.task_combo = ttk.Combobox(task_row, textvariable=self.task_var, state="readonly", width=70)
-        self.task_combo.pack(side="left", fill="x", expand=True, padx=8)
-        self.task_combo.bind("<<ComboboxSelected>>", lambda _event: self.on_select_task())
+        ttk.Label(task_row, textvariable=self.task_info_var).pack(side="left")
+        if self.on_back_to_tasks is not None:
+            ttk.Button(task_row, text="返回任务管理", command=self.on_back_to_tasks).pack(side="right")
 
         window_row = ttk.Frame(controls)
         window_row.pack(fill="x", padx=8, pady=4)
@@ -219,19 +217,12 @@ class ReviewWindow(ttk.Frame):
         self.bind_all("<Left>", lambda _event: self.nudge_selected_boundary(-self._edit_step_sec))
         self.bind_all("<Right>", lambda _event: self.nudge_selected_boundary(self._edit_step_sec))
 
-    def refresh_tasks(self) -> None:
-        tasks = self.review_service.list_tasks()
-        choices = [f"{task.id} | {task.video_name} | {task.speaker_id} | {task.status}" for task in tasks]
-        self.task_combo["values"] = choices
-        if choices and not self.task_var.get():
-            self.task_combo.current(0)
-            self.on_select_task()
-
-    def on_select_task(self) -> None:
-        raw = self.task_var.get().strip()
-        if not raw:
-            return
-        self.current_task_id = int(raw.split("|", maxsplit=1)[0].strip())
+    def load_task(self, task_id: int) -> None:
+        self.current_task_id = int(task_id)
+        task = self.review_service.get_task(self.current_task_id)
+        self.task_info_var.set(
+            f"当前任务: #{task.id} | {task.video_name} | {task.speaker_id} | {task.status}"
+        )
         self.total_duration_sec = self.review_service.get_task_duration_sec(self.current_task_id)
         self._all_segments_cache = sorted(self.review_service.list_all_segments(self.current_task_id), key=lambda x: x.start_sec)
         default_window = min(20000.0, self.total_duration_sec) if self.total_duration_sec > 0 else 20000.0
@@ -370,7 +361,10 @@ class ReviewWindow(ttk.Frame):
             return
         self.review_service.complete_review(self.current_task_id)
         self.on_task_refresh()
-        self.refresh_tasks()
+        task = self.review_service.get_task(self.current_task_id)
+        self.task_info_var.set(
+            f"当前任务: #{task.id} | {task.video_name} | {task.speaker_id} | {task.status}"
+        )
 
     def save_profile(self) -> None:
         if self.current_task_id is None:
@@ -969,6 +963,11 @@ class ReviewWindow(ttk.Frame):
         except ValueError:
             return
 
+        try:
+            min_t, _max_t = self.get_thresholds()
+        except ValueError:
+            min_t = 0.0
+
         segments = self.review_service.list_window_segments(self.current_task_id, window_start, window_end)
         width = max(self.heat_canvas.winfo_width(), 1)
         height = max(self.heat_canvas.winfo_height(), 1)
@@ -1017,11 +1016,7 @@ class ReviewWindow(ttk.Frame):
             x1 = axis_left + (segment.end_sec / self.total_duration_sec) * (axis_right - axis_left)
             y1 = axis_y - 8
             y0 = y1 - (segment.heat_score * (height - 38))
-            color = "#4caf50"
-            if segment.current_label == "uninteresting":
-                color = "#9e9e9e"
-            elif segment.current_label == "interesting":
-                color = "#ff9800"
+            color = "#4caf50" if segment.heat_score >= min_t else "#9e9e9e"
             self.heat_canvas.create_rectangle(x0, y0, x1, y1, fill=color, outline="")
 
     def draw_local_progress(self) -> None:

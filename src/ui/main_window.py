@@ -22,7 +22,7 @@ class MainWindow(tk.Tk):
         super().__init__()
         self.title("Segment By Motion - MVP")
         self.geometry("1360x900")
-        self.minsize(1200, 780)
+        self.minsize(1200, 1300)
 
         self.task_repository = task_repository
         self.ingest_service = ingest_service
@@ -46,15 +46,20 @@ class MainWindow(tk.Tk):
             height=12,
         )
 
-        notebook = ttk.Notebook(self)
-        notebook.pack(fill="both", expand=True)
+        self.page_container = ttk.Frame(self)
+        self.page_container.pack(fill="both", expand=True)
 
-        self.task_page = ttk.Frame(notebook)
-        notebook.add(self.task_page, text="任务管理")
+        self.task_page = ttk.Frame(self.page_container)
         self._build_task_page()
 
-        self.review_page = ReviewWindow(notebook, review_service=self.review_service, on_task_refresh=self.refresh_tasks)
-        notebook.add(self.review_page, text="Review")
+        self.review_page = ReviewWindow(
+            self.page_container,
+            review_service=self.review_service,
+            on_task_refresh=self.refresh_tasks,
+            on_back_to_tasks=self.show_task_page,
+        )
+
+        self.task_page.pack(fill="both", expand=True)
 
         self.refresh_tasks()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -73,7 +78,9 @@ class MainWindow(tk.Tk):
         self.create_task_button = ttk.Button(top, text="创建任务并计算热度", command=self.create_task)
         self.create_task_button.grid(row=1, column=2, padx=4)
         ttk.Button(top, text="刷新列表", command=self.refresh_tasks).grid(row=1, column=3, padx=4)
-        ttk.Button(top, text="发送到第三阶段(Stub)", command=self.send_to_stage3).grid(row=1, column=4, padx=4)
+        ttk.Button(top, text="删除所选任务", command=self.delete_selected_task).grid(row=1, column=4, padx=4)
+        ttk.Button(top, text="发送到第三阶段(Stub)", command=self.send_to_stage3).grid(row=1, column=5, padx=4)
+        ttk.Label(top, text="提示: 双击任务进入 Review").grid(row=2, column=1, columnspan=4, sticky="w", padx=6, pady=(4, 0))
 
         top.columnconfigure(1, weight=1)
 
@@ -86,9 +93,19 @@ class MainWindow(tk.Tk):
         self.tasks_tree.column("video", anchor="w")
 
         self.tasks_tree.pack(side="left", fill="both", expand=True)
+        self.tasks_tree.bind("<Double-1>", self.open_review_for_selected_task)
         scrollbar = ttk.Scrollbar(table_wrap, orient="vertical", command=self.tasks_tree.yview)
         self.tasks_tree.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
+
+    def show_task_page(self) -> None:
+        self.review_page.pack_forget()
+        self.task_page.pack(fill="both", expand=True)
+
+    def show_review_page(self, task_id: int) -> None:
+        self.task_page.pack_forget()
+        self.review_page.pack(fill="both", expand=True)
+        self.review_page.load_task(task_id)
 
     def pick_video(self) -> None:
         path = filedialog.askopenfilename(
@@ -144,7 +161,6 @@ class MainWindow(tk.Tk):
         if status == "ok":
             task = payload
             self.refresh_tasks()
-            self.review_page.refresh_tasks()
             messagebox.showinfo("任务已创建", f"Task {task.id} 已完成阶段一分段与热度计算")
             return
 
@@ -204,6 +220,30 @@ class MainWindow(tk.Tk):
         if not selected:
             return None
         return int(self.tasks_tree.item(selected[0], "values")[0])
+
+    def open_review_for_selected_task(self, _event=None) -> None:
+        task_id = self.selected_task_id()
+        if task_id is None:
+            return
+        self.show_review_page(task_id)
+
+    def delete_selected_task(self) -> None:
+        task_id = self.selected_task_id()
+        if task_id is None:
+            messagebox.showinfo("提示", "请先在列表中选择任务")
+            return
+
+        confirmed = messagebox.askyesno("确认删除", f"确认删除任务 {task_id} 及其所有分段和标记记录吗？")
+        if not confirmed:
+            return
+
+        deleted = self.task_repository.delete_task(task_id)
+        if deleted <= 0:
+            messagebox.showerror("删除失败", f"未找到任务 {task_id}")
+            return
+
+        self.refresh_tasks()
+        messagebox.showinfo("删除完成", f"任务 {task_id} 已删除")
 
     def send_to_stage3(self) -> None:
         task_id = self.selected_task_id()

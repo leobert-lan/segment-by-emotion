@@ -72,6 +72,37 @@ class ReviewServiceStatsTest(unittest.TestCase):
             self.assertAlmostEqual(refreshed[1].heat_score, 0.7, places=6)
             self.assertAlmostEqual(refreshed[2].heat_score, 0.7, places=6)
 
+    def test_delete_task_cascades_segments_and_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db_path = root / "test.db"
+            schema_path = Path(__file__).resolve().parents[1] / "src" / "infra" / "schema.sql"
+
+            database = Database(db_path)
+            database.initialize(schema_path)
+            task_repo = TaskRepository(database)
+
+            task = task_repo.create_task("demo.mp4", "speaker_a", segment_duration=5.0)
+            task_repo.insert_segments(task.id, [(0.0, 2.0, 0.6)])
+            segment = task_repo.list_segments(task.id, include_labeled=True)[0]
+            task_repo.add_label_event(task.id, segment.id, None, "interesting")
+
+            deleted = task_repo.delete_task(task.id)
+
+            self.assertEqual(deleted, 1)
+            self.assertEqual(task_repo.list_segments(task.id, include_labeled=True), [])
+            with database.session() as connection:
+                event_count = connection.execute(
+                    "SELECT COUNT(*) AS cnt FROM label_events WHERE task_id = ?",
+                    (task.id,),
+                ).fetchone()["cnt"]
+                task_count = connection.execute(
+                    "SELECT COUNT(*) AS cnt FROM tasks WHERE id = ?",
+                    (task.id,),
+                ).fetchone()["cnt"]
+            self.assertEqual(event_count, 0)
+            self.assertEqual(task_count, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

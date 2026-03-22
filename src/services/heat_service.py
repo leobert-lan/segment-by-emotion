@@ -10,8 +10,19 @@ from pathlib import Path
 
 
 class HeatAnalyzer:
-    def __init__(self, target_sr: int = 16000) -> None:
+    def __init__(
+        self,
+        target_sr: int = 16000,
+        regularize_window_size: int = 5,
+        regularize_max_gap_segments: int = 1,
+        regularize_max_spike_segments: int = 1,
+        regularize_sigma_factor: float = 1.0,
+    ) -> None:
         self.target_sr = target_sr
+        self.regularize_window_size = max(3, int(regularize_window_size))
+        self.regularize_max_gap_segments = max(0, int(regularize_max_gap_segments))
+        self.regularize_max_spike_segments = max(0, int(regularize_max_spike_segments))
+        self.regularize_sigma_factor = max(0.0, float(regularize_sigma_factor))
 
     def estimate_duration_sec(self, video_path: str) -> float:
         audio, sample_rate = self._try_load_audio(video_path)
@@ -130,6 +141,9 @@ class HeatAnalyzer:
         rms_values: list[float] = []
         zcr_values: list[float] = []
         onset_values: list[float] = []
+        centroid_values: list[float] = []
+        pitch_level_values: list[float] = []
+        pitch_cv_values: list[float] = []
 
         for index in range(segment_count):
             start_sample = int(index * segment_duration * sample_rate)
@@ -139,6 +153,9 @@ class HeatAnalyzer:
                 rms_values.append(0.0)
                 zcr_values.append(0.0)
                 onset_values.append(0.0)
+                centroid_values.append(0.0)
+                pitch_level_values.append(0.0)
+                pitch_cv_values.append(1.0)
                 continue
 
             rms = float(np.sqrt(np.mean(np.square(segment_audio))))
@@ -155,18 +172,91 @@ class HeatAnalyzer:
             onset_env = librosa.onset.onset_strength(y=segment_audio, sr=sample_rate)
             onset = float(onset_env.mean()) if len(onset_env) > 0 else 0.0
 
+            centroid_series = librosa.feature.spectral_centroid(
+                y=segment_audio,
+                sr=sample_rate,
+                n_fft=frame_length,
+                hop_length=hop_length,
+            )
+            centroid = float(centroid_series.mean()) if centroid_series.size > 0 else 0.0
+
+            pitch_level = 0.0
+            pitch_cv = 1.0
+            try:
+                pitch_series = librosa.yin(
+                    segment_audio,
+                    fmin=librosa.note_to_hz("C2"),
+                    fmax=librosa.note_to_hz("C7"),
+                    sr=sample_rate,
+                    frame_length=frame_length,
+                    hop_length=hop_length,
+                )
+                valid_pitch = pitch_series[np.isfinite(pitch_series)]
+                if valid_pitch.size > 0:
+                    pitch_level = float(valid_pitch.mean())
+                    pitch_cv = float(valid_pitch.std() / (pitch_level + 1e-9))
+            except Exception:
+                # Fallback keeps algorithm robust when pitch extraction is unstable.
+                pitch_level = 0.0
+                pitch_cv = 1.0
+
             rms_values.append(rms)
             zcr_values.append(zcr)
             onset_values.append(onset)
+            centroid_values.append(centroid)
+            pitch_level_values.append(pitch_level)
+            pitch_cv_values.append(pitch_cv)
 
-        rms_norm = self._minmax_normalize(rms_values)
-        zcr_norm = self._minmax_normalize(zcr_values)
-        onset_norm = self._minmax_normalize(onset_values)
+        rms_norm = self._hybrid_normalize(rms_values)
+        zcr_norm = self._hybrid_normalize(zcr_values)
+        onset_norm = self._hybrid_normalize(onset_values)
+        centroid_norm = self._hybrid_normalize(centroid_values)
+        pitch_level_norm = self._hybrid_normalize(pitch_level_values)
+        pitch_stability = [1.0 / (1.0 + max(0.0, value)) for value in pitch_cv_values]
+        pitch_stability_norm = self._hybrid_normalize(pitch_stability)
 
-        scores = [
-            max(0.0, min(1.0, 0.55 * rms_norm[i] + 0.25 * zcr_norm[i] + 0.20 * onset_norm[i]))
-            for i in range(segment_count)
-        ]
+        rate_up_values: list[float] = []
+        for index in range(segment_count):
+            if index == 0:
+                rate_up_values.append(0.0)
+                continue
+            zcr_delta = max(0.0, zcr_norm[index] - zcr_norm[index - 1])
+            onset_delta = max(0.0, onset_norm[index] - onset_norm[index - 1])
+            rate_up_values.append(max(0.0, min(1.0, 0.6 * zcr_delta + 0.4 * onset_delta)))
+
+        scores: list[float] = []
+        for index in range(segment_count):
+            base_score = (
+                0.22 * rms_norm[index]
+                + 0.12 * zcr_norm[index]
+                + 0.14 * onset_norm[index]
+                + 0.18 * centroid_norm[index]
+                + 0.20 * pitch_level_norm[index]
+                + 0.14 * pitch_stability_norm[index]
+            )
+
+            vowel_bonus = 0.0
+            if pitch_cv_values[index] < 0.12 and zcr_norm[index] < 0.25 and pitch_level_norm[index] > 0.10:
+                vowel_bonus = 0.08
+
+            high_pitch_bonus = 0.0
+            if pitch_level_norm[index] > 0.70:
+                high_pitch_bonus = 0.10 * ((pitch_level_norm[index] - 0.70) / 0.30)
+
+            rate_up_bonus = 0.08 * rate_up_values[index]
+
+            emotion_index = max(
+                0.0,
+                min(1.0, 0.45 * rms_norm[index] + 0.30 * onset_norm[index] + 0.25 * centroid_norm[index]),
+            )
+            excited_bonus = 0.12 * max(0.0, (emotion_index - 0.55) / 0.45)
+
+            raw_score = max(0.0, min(1.0, base_score + vowel_bonus + high_pitch_bonus + rate_up_bonus + excited_bonus))
+            sigmoid_score = 1.0 / (1.0 + math.exp(-4.0 * (raw_score - 0.55)))
+            scores.append(max(0.0, min(1.0, 0.6 * raw_score + 0.4 * sigmoid_score)))
+
+        scores = self._smooth_scores(scores)
+        scores = self._temporal_regularize_scores(scores)
         scores = self._smooth_scores(scores)
 
         segments: list[tuple[float, float, float]] = []
@@ -185,6 +275,35 @@ class HeatAnalyzer:
             return [0.0 for _ in values]
         return [(value - min_value) / (max_value - min_value) for value in values]
 
+    def _hybrid_normalize(
+        self,
+        values: list[float],
+        local_window: int = 3,
+        global_weight: float = 0.7,
+    ) -> list[float]:
+        if not values:
+            return []
+
+        global_norm = self._minmax_normalize(values)
+        local_norm: list[float] = []
+
+        for index, value in enumerate(values):
+            left = max(0, index - local_window)
+            right = min(len(values), index + local_window + 1)
+            window = values[left:right]
+            window_min = min(window)
+            window_max = max(window)
+            if window_max - window_min < 1e-9:
+                local_norm.append(0.0)
+            else:
+                local_norm.append((value - window_min) / (window_max - window_min))
+
+        local_weight = 1.0 - global_weight
+        return [
+            max(0.0, min(1.0, global_weight * global_norm[i] + local_weight * local_norm[i]))
+            for i in range(len(values))
+        ]
+
     def _smooth_scores(self, scores: list[float]) -> list[float]:
         if len(scores) < 3:
             return scores
@@ -194,6 +313,95 @@ class HeatAnalyzer:
             right = scores[index + 1] if index < len(scores) - 1 else score
             smoothed.append(max(0.0, min(1.0, 0.2 * left + 0.6 * score + 0.2 * right)))
         return smoothed
+
+    def _temporal_regularize_scores(self, scores: list[float]) -> list[float]:
+        if len(scores) < 5:
+            return scores
+
+        baseline = self._rolling_median(scores, self.regularize_window_size)
+        residuals = [scores[i] - baseline[i] for i in range(len(scores))]
+        robust_scale = self._robust_scale(residuals)
+        sigma = self.regularize_sigma_factor * robust_scale
+
+        threshold = max(0.02, min(0.08, 0.5 * sigma))
+        high_mask = [scores[i] >= baseline[i] + threshold for i in range(len(scores))]
+        low_mask = [scores[i] <= baseline[i] - threshold for i in range(len(scores))]
+        adjusted = list(scores)
+
+        for start, end in self._collect_true_runs(low_mask):
+            run_length = end - start
+            if run_length > self.regularize_max_gap_segments or start == 0 or end >= len(scores):
+                continue
+
+            left_value = adjusted[start - 1]
+            right_value = adjusted[end]
+            valley = sum(adjusted[start:end]) / float(run_length)
+            support = min(left_value, right_value)
+            if support - valley < max(0.04, 0.35 * sigma):
+                continue
+
+            for offset, index in enumerate(range(start, end)):
+                ratio = (offset + 1) / float(run_length + 1)
+                interp = left_value + (right_value - left_value) * ratio
+                lifted = 0.75 * interp + 0.25 * baseline[index]
+                adjusted[index] = max(adjusted[index], min(1.0, lifted))
+
+        for start, end in self._collect_true_runs(high_mask):
+            run_length = end - start
+            if run_length > self.regularize_max_spike_segments or start == 0 or end >= len(scores):
+                continue
+
+            left_value = adjusted[start - 1]
+            right_value = adjusted[end]
+            peak = max(adjusted[start:end])
+            context = max(left_value, right_value)
+            if peak - context < max(0.04, 0.35 * sigma):
+                continue
+
+            cap = min(1.0, min(left_value, right_value) + 0.4 * max(0.04, sigma))
+            for index in range(start, end):
+                adjusted[index] = min(adjusted[index], cap)
+
+        return [max(0.0, min(1.0, value)) for value in adjusted]
+
+    def _rolling_median(self, values: list[float], window_size: int) -> list[float]:
+        half = max(1, window_size // 2)
+        medians: list[float] = []
+        for index in range(len(values)):
+            left = max(0, index - half)
+            right = min(len(values), index + half + 1)
+            window = sorted(values[left:right])
+            medians.append(self._median(window))
+        return medians
+
+    def _robust_scale(self, values: list[float]) -> float:
+        center = self._median(values)
+        abs_dev = [abs(value - center) for value in values]
+        mad = self._median(abs_dev)
+        return max(1e-4, 1.4826 * mad)
+
+    def _median(self, values: list[float]) -> float:
+        if not values:
+            return 0.0
+        sorted_values = sorted(values)
+        middle = len(sorted_values) // 2
+        if len(sorted_values) % 2 == 1:
+            return float(sorted_values[middle])
+        return float((sorted_values[middle - 1] + sorted_values[middle]) / 2.0)
+
+    def _collect_true_runs(self, mask: list[bool]) -> list[tuple[int, int]]:
+        runs: list[tuple[int, int]] = []
+        index = 0
+        while index < len(mask):
+            if not mask[index]:
+                index += 1
+                continue
+            start = index
+            while index < len(mask) and mask[index]:
+                index += 1
+            runs.append((start, index))
+        return runs
+
 
     def _fallback_duration(self, video_path: str) -> float:
         try:
