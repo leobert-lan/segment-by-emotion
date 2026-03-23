@@ -2,7 +2,8 @@ import tkinter as tk
 from queue import Empty, Queue
 from threading import Thread
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
+from typing import Optional
 
 from src.infra.repositories import TaskRepository
 from src.services.ingest_service import TaskIngestService
@@ -18,6 +19,8 @@ class MainWindow(tk.Tk):
         ingest_service: TaskIngestService,
         review_service: ReviewService,
         stage3_stub: Stage3PipelineStub,
+        dispatch_service=None,   # DispatchService | None
+        socket_server=None,      # SocketServer | None
     ) -> None:
         super().__init__()
         self.title("Segment By Motion - MVP")
@@ -28,6 +31,8 @@ class MainWindow(tk.Tk):
         self.ingest_service = ingest_service
         self.review_service = review_service
         self.stage3_stub = stage3_stub
+        self.dispatch_service = dispatch_service
+        self.socket_server = socket_server
 
         self.video_path_var = tk.StringVar()
         self.import_dir_var = tk.StringVar()
@@ -47,6 +52,11 @@ class MainWindow(tk.Tk):
 
         self.tasks_tree: ttk.Treeview | None = None
 
+        # 节点状态面板组件
+        self.nodes_tree: Optional[ttk.Treeview] = None
+        self.dispatch_records_tree: Optional[ttk.Treeview] = None
+        self._node_refresh_after_id: Optional[str] = None
+
         self.page_container = ttk.Frame(self)
         self.page_container.pack(fill="both", expand=True)
 
@@ -63,6 +73,7 @@ class MainWindow(tk.Tk):
         self.task_page.pack(fill="both", expand=True)
 
         self.refresh_tasks()
+        self._schedule_node_refresh()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _build_task_page(self) -> None:
@@ -88,18 +99,19 @@ class MainWindow(tk.Tk):
         ttk.Button(top, text="刷新列表", command=self.refresh_tasks).grid(row=2, column=3, padx=4)
         ttk.Button(top, text="删除所选任务", command=self.delete_selected_task).grid(row=2, column=4, padx=4)
         ttk.Button(top, text="发送到第三阶段(Stub)", command=self.send_to_stage3).grid(row=2, column=5, padx=4)
+        ttk.Button(top, text="下发到节点", command=self.dispatch_to_node).grid(row=2, column=6, padx=4)
         ttk.Label(top, text="提示: 双击任务进入 Review").grid(row=3, column=1, columnspan=5, sticky="w", padx=6, pady=(2, 0))
 
         top.columnconfigure(1, weight=1)
 
         table_wrap = ttk.Frame(self.task_page)
-        table_wrap.pack(fill="both", expand=True, padx=12, pady=(4, 12))
+        table_wrap.pack(fill="both", expand=True, padx=12, pady=(4, 4))
 
         self.tasks_tree = ttk.Treeview(
             table_wrap,
             columns=("id", "video", "speaker", "status", "segments"),
             show="headings",
-            height=12,
+            height=10,
         )
 
         for col, width in (("id", 60), ("video", 420), ("speaker", 120), ("status", 150), ("segments", 100)):
@@ -109,9 +121,67 @@ class MainWindow(tk.Tk):
 
         self.tasks_tree.pack(side="left", fill="both", expand=True)
         self.tasks_tree.bind("<Double-1>", self.open_review_for_selected_task)
+        self.tasks_tree.bind("<<TreeviewSelect>>", self._on_task_selected)
         scrollbar = ttk.Scrollbar(table_wrap, orient="vertical", command=self.tasks_tree.yview)
         self.tasks_tree.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
+
+        # ── 节点状态面板 ──────────────────────────────────────────────────────
+        node_frame = ttk.LabelFrame(self.task_page, text="节点状态")
+        node_frame.pack(fill="x", padx=12, pady=(4, 4))
+
+        top_btns = ttk.Frame(node_frame)
+        top_btns.pack(fill="x", padx=6, pady=4)
+        ttk.Button(top_btns, text="刷新节点", command=self._refresh_nodes).pack(side="left", padx=4)
+        ttk.Label(top_btns, text="（每 5 秒自动刷新）").pack(side="left")
+
+        node_tree_wrap = ttk.Frame(node_frame)
+        node_tree_wrap.pack(fill="x", padx=6, pady=(0, 4))
+
+        self.nodes_tree = ttk.Treeview(
+            node_tree_wrap,
+            columns=("node_id", "ip", "status", "dispatch_id", "last_seen"),
+            show="headings",
+            height=4,
+        )
+        for col, text, width in (
+            ("node_id", "节点ID", 180),
+            ("ip", "IP地址", 120),
+            ("status", "状态", 80),
+            ("dispatch_id", "当前分发", 80),
+            ("last_seen", "最近心跳", 200),
+        ):
+            self.nodes_tree.heading(col, text=text)
+            self.nodes_tree.column(col, width=width, anchor="center")
+        self.nodes_tree.pack(side="left", fill="x", expand=True)
+
+        # ── 分发进度子面板 ────────────────────────────────────────────────────
+        dr_frame = ttk.LabelFrame(self.task_page, text="所选任务分发记录")
+        dr_frame.pack(fill="x", padx=12, pady=(0, 8))
+
+        dr_wrap = ttk.Frame(dr_frame)
+        dr_wrap.pack(fill="x", padx=6, pady=4)
+
+        self.dispatch_records_tree = ttk.Treeview(
+            dr_wrap,
+            columns=("id", "node_id", "status", "created_at", "updated_at", "error"),
+            show="headings",
+            height=4,
+        )
+        for col, text, width in (
+            ("id", "记录ID", 60),
+            ("node_id", "节点", 160),
+            ("status", "分发状态", 120),
+            ("created_at", "创建时间", 180),
+            ("updated_at", "更新时间", 180),
+            ("error", "错误原因", 200),
+        ):
+            self.dispatch_records_tree.heading(col, text=text)
+            self.dispatch_records_tree.column(col, width=width, anchor="center")
+        self.dispatch_records_tree.pack(side="left", fill="x", expand=True)
+        dr_sb = ttk.Scrollbar(dr_wrap, orient="vertical", command=self.dispatch_records_tree.yview)
+        self.dispatch_records_tree.configure(yscrollcommand=dr_sb.set)
+        dr_sb.pack(side="right", fill="y")
 
     def show_task_page(self) -> None:
         self.review_page.stop_playback_for_navigation()
@@ -353,7 +423,131 @@ class MainWindow(tk.Tk):
         msg = self.stage3_stub.enqueue(task_id)
         messagebox.showinfo("第三阶段", msg)
 
+    def dispatch_to_node(self) -> None:
+        """将 review_done 任务下发到在线节点。"""
+        if self.dispatch_service is None or self.socket_server is None:
+            messagebox.showerror("功能未启用", "Socket 服务端未初始化")
+            return
+
+        task_id = self.selected_task_id()
+        if task_id is None:
+            messagebox.showinfo("提示", "请先在列表中选择任务")
+            return
+
+        # 验证任务状态
+        try:
+            task = self.task_repository.get_task(task_id)
+        except ValueError:
+            messagebox.showerror("任务不存在", f"任务 {task_id} 不存在")
+            return
+
+        if task.status != "review_done":
+            messagebox.showwarning(
+                "状态不符",
+                f"任务当前状态为 {task.status!r}，仅 review_done 状态可下发到节点",
+            )
+            return
+
+        # 获取在线节点列表
+        online_nodes = self.dispatch_service.list_online_nodes()
+        if not online_nodes:
+            messagebox.showwarning("无可用节点", "当前没有在线节点，请先连接 Android 处理节点")
+            return
+
+        # 节点选择（一个直接用，多个弹对话框）
+        if len(online_nodes) == 1:
+            node_id = online_nodes[0]["node_id"]
+        else:
+            node_ids = [n["node_id"] for n in online_nodes]
+            node_id = simpledialog.askstring(
+                "选择节点",
+                f"当前在线节点：\n" + "\n".join(
+                    f"  {n['node_id']} ({n['ip']}, {n['status']})"
+                    for n in online_nodes
+                ) + "\n\n请输入节点ID：",
+                initialvalue=node_ids[0],
+            )
+            if not node_id:
+                return
+            if node_id not in node_ids:
+                messagebox.showerror("节点不存在", f"节点 {node_id!r} 不在线")
+                return
+
+        confirmed = messagebox.askyesno(
+            "确认下发",
+            f"将任务 {task_id}（{task.video_name}）\n下发到节点 {node_id}？",
+        )
+        if not confirmed:
+            return
+
+        # 通过 socket_server 事件循环异步执行分发
+        try:
+            future = self.socket_server.schedule_coroutine(
+                self.dispatch_service.dispatch_task(task_id, node_id)
+            )
+            messagebox.showinfo(
+                "已提交",
+                f"任务 {task_id} 已提交下发到节点 {node_id}\n\n"
+                "分发进度请在下方「所选任务分发记录」面板中查看。",
+            )
+            self._refresh_dispatch_records()
+        except Exception as exc:
+            messagebox.showerror("下发失败", str(exc))
+
+    def _on_task_selected(self, _event=None) -> None:
+        """任务列表选中变化时，刷新分发记录面板。"""
+        self._refresh_dispatch_records()
+
+    def _schedule_node_refresh(self) -> None:
+        """每 5 秒自动刷新节点状态。"""
+        self._refresh_nodes()
+        self._node_refresh_after_id = self.after(5000, self._schedule_node_refresh)
+
+    def _refresh_nodes(self) -> None:
+        """刷新节点状态 Treeview。"""
+        if self.nodes_tree is None or self.dispatch_service is None:
+            return
+        self.nodes_tree.delete(*self.nodes_tree.get_children())
+        for node in self.dispatch_service.list_online_nodes():
+            self.nodes_tree.insert(
+                "",
+                "end",
+                values=(
+                    node.get("node_id", ""),
+                    node.get("ip", ""),
+                    node.get("status", ""),
+                    node.get("dispatch_id") or "",
+                    node.get("last_seen", "")[:19],
+                ),
+            )
+        self._refresh_dispatch_records()
+
+    def _refresh_dispatch_records(self) -> None:
+        """刷新所选任务的分发记录 Treeview。"""
+        if self.dispatch_records_tree is None or self.dispatch_service is None:
+            return
+        task_id = self.selected_task_id()
+        self.dispatch_records_tree.delete(*self.dispatch_records_tree.get_children())
+        if task_id is None:
+            return
+        for rec in self.dispatch_service.list_dispatch_records(task_id):
+            self.dispatch_records_tree.insert(
+                "",
+                "end",
+                values=(
+                    rec.id,
+                    rec.node_id,
+                    rec.dispatch_status,
+                    rec.created_at.isoformat()[:19],
+                    rec.updated_at.isoformat()[:19],
+                    rec.error_reason or "",
+                ),
+            )
+
     def on_close(self) -> None:
+        if self._node_refresh_after_id is not None:
+            self.after_cancel(self._node_refresh_after_id)
+            self._node_refresh_after_id = None
         if self._create_task_poll_after_id is not None:
             self.after_cancel(self._create_task_poll_after_id)
             self._create_task_poll_after_id = None
