@@ -51,30 +51,36 @@ class TaskOrchestrator(
     private var currentTask: NodeTask? = null
 
     suspend fun run() {
-        val pending = withContext(Dispatchers.IO) { db.taskDao().getPendingTask() }
-        if (pending != null) {
-            Log.i(TAG, "Resuming incomplete task: ${pending.taskId}")
-        }
-
-        val host = prefs.serverHost.first()
-        val controlPort = prefs.controlPort.first()
-        val dataPort = prefs.dataPort.first()
-
-        _taskState.value = TaskState.Connecting(host, controlPort, dataPort)
-        connectionManager.connectWithRetry()
-
-        val ctrl = connectionManager.controlChannel ?: run {
-            _taskState.value = TaskState.Error(null, "Control channel unavailable", recoverable = true)
-            return
-        }
-
-        ctrl.incomingMessages.collect { msg ->
-            when (msg) {
-                is ControlMessage.HelloAck -> handleHelloAck(msg)
-                is ControlMessage.TaskAssign -> handleTaskAssign(msg)
-                is ControlMessage.TaskStatusQuery -> handleStatusQuery(msg)
-                else -> Unit
+        try {
+            val pending = withContext(Dispatchers.IO) { db.taskDao().getPendingTask() }
+            if (pending != null) {
+                Log.i(TAG, "Resuming incomplete task: ${pending.taskId}")
             }
+
+            val host = prefs.serverHost.first()
+            val controlPort = prefs.controlPort.first()
+            val dataPort = prefs.dataPort.first()
+
+            _taskState.value = TaskState.Connecting(host, controlPort, dataPort)
+            connectionManager.connectWithRetry()
+
+            val ctrl = connectionManager.controlChannel ?: run {
+                _taskState.value = TaskState.Error(null, "Control channel unavailable", recoverable = true)
+                return
+            }
+
+            Log.i(TAG, "Control channel ready; waiting control messages")
+            ctrl.incomingMessages.collect { msg ->
+                when (msg) {
+                    is ControlMessage.HelloAck -> handleHelloAck(msg)
+                    is ControlMessage.TaskAssign -> handleTaskAssign(msg)
+                    is ControlMessage.TaskStatusQuery -> handleStatusQuery(msg)
+                    else -> Unit
+                }
+            }
+        } finally {
+            Log.i(TAG, "Orchestrator stopping; disconnecting socket channels")
+            runCatching { connectionManager.disconnect() }
         }
     }
 

@@ -1,136 +1,171 @@
-# Socket 服务端与处理节点协同设计
+# Socket 服务端与处理节点协同设计（现网实现对齐版）
 
-## 1. 背景与目标
-- 本软件作为 socket 服务端，负责任务编排、状态跟踪、资料分发和结果回收。
-- Android 或其它设备作为视频处理节点，负责执行下发任务并回传处理结果。
-- 目标：支持节点上线同步、任务状态查询、任务确认后资料传输、断点续传、结果回传与落盘。
+> 更新时间：2026-03-23  
+> 目标：与当前 `src/net/socket/socket_server.py`、`src/services/dispatch_service.py`、`MediaService/...` 实现保持一致，降低排障理解成本。
 
-## 2. 角色与职责
-- 服务端
-  - 维护任务队列与状态机。
-  - 维护节点注册表（在线状态、能力、当前任务）。
-  - 管理传输会话（分片、校验、断点续传）。
-- 节点
-  - 上报节点信息与本地任务状态。
-  - 接收任务并确认。
-  - 下载任务资料并执行处理。
-  - 上传结果与处理日志。
+## 1. 总览
 
-## 3. 传输通道与端口规划
+- 服务端（Python）负责：双通道接入、任务分发、下载分片、结果回传验收、审计。
+- 节点（Android）负责：双通道连接、HELLO 握手、任务执行、结果分片上传。
+- 双通道固定端口：
+  - 控制通道：`23010`（newline JSON）
+  - 数据通道：`23011`（`[4B headerLen][header JSON][payload]`）
 
-### 3.1 双通道原则
-- 指令传输与数据传输必须使用不同端口。
-- 指令通道保持轻量、低延迟，不承载大文件流。
-- 数据通道仅用于分片数据与传输确认，避免阻塞控制消息。
+## 2. 当前协议消息
 
-### 3.2 端口分配（默认）
-- 控制/指令通道端口：`23010`
-- 数据传输通道端口：`23011`
-- 预留扩展端口段：`23012-23019`（后续用于日志流、监控流、批量回传专用通道）
+### 2.1 控制通道（23010）
 
-### 3.3 通道消息映射
-- 控制通道（`23010`）：`HELLO`、`HELLO_ACK`、`TASK_ASSIGN`、`TASK_CONFIRM`、`TASK_STATUS_QUERY`、`TASK_STATUS_REPORT`。
-- 数据通道（`23011`）：`CHUNK`、`CHUNK_ACK`、`TRANSFER_RESUME_REQUEST`、`TRANSFER_COMPLETE`、结果文件上传。
+- Node -> Server: `HELLO`, `TASK_CONFIRM`, `TASK_STATUS_REPORT`
+- Server -> Node: `HELLO_ACK`, `TASK_ASSIGN`, `TASK_STATUS_QUERY`
 
-### 3.4 端口管理要求
-- 避免使用 `0-1023` 系统保留端口。
-- 建议固定使用上述端口，避免使用动态临时端口段 `49152-65535`。
-- 服务端启动时需进行端口占用检测；若冲突，按配置回退到预留端口段并写入启动日志。
-- 节点连接时必须显式声明双端口连接结果，任一通道失败均不得进入任务下发阶段。
+### 2.2 数据通道（23011）
 
-## 4. 任务状态机
-- `created`: 任务已创建。
-- `assigned`: 已分配给节点，等待确认。
-- `confirmed`: 节点已确认，允许传输资料。
-- `transferring`: 资料传输中。
-- `running`: 节点处理中。
-- `uploading`: 结果回传中。
-- `done`: 服务端验收完成。
-- `failed`: 执行或传输失败。
-- `canceled`: 手动取消。
+- Server -> Node（下发视频）: `CHUNK`, `TRANSFER_COMPLETE`
+- Node -> Server（下载确认）: `CHUNK_ACK`, `TRANSFER_RESUME_REQUEST`
+- Node -> Server（回传结果）: `RESULT_CHUNK`, `RESULT_TRANSFER_COMPLETE`
+- Server -> Node（上传确认）: `CHUNK_ACK`（由 Python `MsgChunkAckOut` 发送，线协议 type 同为 `CHUNK_ACK`）
 
-## 5. 节点上线与状态同步
+## 3. 关键实现参数（当前代码）
 
-### 5.1 节点上线（HELLO）
-节点发送：
-```json
-{
-  "type": "HELLO",
-  "node_id": "android-001",
-  "node_version": "1.0.0",
-  "capabilities": {"gpu": false, "codec": ["h264", "hevc"]},
-  "current_task": {"task_id": 123, "status": "running", "progress": 0.42}
-}
+- 下发分片大小：`8MB`（`src/services/dispatch_service.py: DOWNLOAD_CHUNK_SIZE`）
+- Android 上传分片大小：`8MB`（`MediaService/.../UploadManager.kt: CHUNK_SIZE`）
+- ACK 超时：30s（下发 ACK、上传 ACK）
+- 通道配对超时：30s（控制等数据；数据等控制）
+- HELLO 等待超时：30s
+
+## 4. 节点接入与握手（细粒度）
+
+### 4.1 流程图
+
+```mermaid
+flowchart TD
+    A[Node 发起 control:23010] --> B{data:23011 是否已到?}
+    B -- 是 --> C[立即配对]
+    B -- 否 --> D[进入 pending_ctrl 等待 data]
+    D --> E{30s 内 data 到达?}
+    E -- 否 --> F[配对超时, 关闭控制连接]
+    E -- 是 --> C
+    C --> G[等待 HELLO]
+    G --> H{30s 内收到 HELLO?}
+    H -- 否 --> I[HELLO 超时, 关闭连接]
+    H -- 是 --> J[注册 active session]
+    J --> K[DispatchService 发送 HELLO_ACK]
+    K --> L[进入控制/数据循环]
 ```
 
-服务端返回：
-```json
-{
-  "type": "HELLO_ACK",
-  "server_time": "2026-03-22T12:00:00Z",
-  "sync_actions": [
-    {"action": "RESUME_UPLOAD", "task_id": 123},
-    {"action": "QUERY_PROGRESS", "task_id": 123}
-  ]
-}
+### 4.2 时序图
+
+```mermaid
+sequenceDiagram
+    participant N as Android Node
+    participant S as Python SocketServer
+    participant D as DispatchService
+
+    N->>S: TCP connect control(23010)
+    N->>S: TCP connect data(23011)
+    S->>S: pair by peer_ip
+    N->>S: HELLO
+    S->>S: session online
+    S->>D: on_session_ready(session)
+    D->>N: HELLO_ACK(sync_actions)
+    Note over N,S: 双通道都就绪后进入正常通信
 ```
 
-### 5.2 状态查询
-- 服务端可主动发送 `TASK_STATUS_QUERY`。
-- 节点应返回 `TASK_STATUS_REPORT`，包含进度、阶段、最近错误。
+## 5. 完整任务闭环（review_done -> done）
 
-## 6. 任务下发与确认
+```mermaid
+sequenceDiagram
+    participant GUI as Python GUI
+    participant DS as DispatchService
+    participant N as Android Node
+    participant FS as FileStore(Result Dir)
 
-### 6.1 下发任务元数据
-服务端发送 `TASK_ASSIGN`：
-- `task_id`
-- `video_meta`（名称、大小、校验）
-- `processing_params`
-- `result_requirements`
+    GUI->>DS: dispatch_task(taskId,nodeId)
+    DS->>N: TASK_ASSIGN
+    N->>DS: TASK_CONFIRM(accepted=true)
 
-### 6.2 节点确认
-- 节点返回 `TASK_CONFIRM`（接受/拒绝 + 原因）。
-- 服务端收到确认后将任务状态置为 `confirmed`，进入资料传输。
+    loop 每个 8MB chunk
+        DS->>N: CHUNK(taskId,transferId,chunkIndex,hash,payload)
+        N->>DS: CHUNK_ACK(taskId,transferId,chunkIndex)
+    end
+    DS->>N: TRANSFER_COMPLETE(totalHash)
 
-## 7. 资料传输与断点续传
+    N->>N: 本地组装 + 处理 + 产出 result.mp4/result.json
 
-### 7.1 分片协议
-- 使用固定大小 chunk（如 1MB）。
-- 每片携带：`task_id`、`transfer_id`、`chunk_index`、`chunk_hash`、`payload`。
-- 每片确认：`CHUNK_ACK`。
+    loop 上传每个 chunk
+        N->>DS: RESULT_CHUNK(taskId,transferId,chunkIndex,fileRole,payload)
+        DS->>N: CHUNK_ACK(taskId,transferId,chunkIndex)
+    end
+    N->>DS: RESULT_TRANSFER_COMPLETE(totalHash)
+    DS->>FS: ingest + hash校验 + 文件组装
+    DS->>GUI: 状态 done
+```
 
-### 7.2 断点续传
-- 节点断开后重连，发送 `TRANSFER_RESUME_REQUEST`（包含已接收 chunk bitmap 或最后确认索引）。
-- 服务端按缺失分片补发。
-- 全量完成后，节点发送 `TRANSFER_COMPLETE`，服务端校验总 hash。
+## 6. ACK 超时排障（重点）
 
-## 8. 结果回传与存储
+### 6.1 Node 上传 `RESULT_CHUNK` 后等待 ACK 超时
 
-### 8.1 回传内容
-- 必选：结果清单（JSON）、处理日志、热度数据导出（JSON+CSV）。
-- 可选：中间产物、调试快照。
+常见原因按优先级：
 
-### 8.2 服务端落盘建议
-- `data/node_results/<task_id>/<node_id>/`
-  - `result.json`
-  - `heat_export.json`
-  - `heat_export.csv`
-  - `logs/*.log`
-- 完成后更新任务状态 `done`，记录 `completed_at` 与摘要信息。
+1. **服务端未进入数据读循环**（历史 data-first 配对路径易出现，现已修复）。
+2. payloadSize 或 chunkHash 校验失败，服务端按协议不 ACK，等待节点重传。
+3. 服务端写盘失败（磁盘/路径权限/IO 异常），服务端不 ACK。
+4. 数据通道中断，ACK 发不出去。
 
-## 9. 一致性与安全
-- 消息级别 `request_id` 防重。
-- 传输分片 hash + 文件总 hash 双重校验。
-- 建议支持 token 或 mTLS 认证。
-- 关键状态变更写入审计日志。
+### 6.2 服务端新增观测点
 
-## 10. 失败恢复策略
-- 网络中断：基于 `transfer_id` 断点续传。
-- 节点崩溃：上线后通过 `HELLO` 回传当前任务状态并恢复。
-- 服务端重启：从数据库恢复任务状态和未完成传输会话。
+- `[protocol][data_loop_start]`：确认数据循环已启动。
+- `recv RESULT_CHUNK ...`：确认帧已进入 Python。
+- `drop message reason=invalid_field ...`：payload/hash 校验失败。
+- `drop message reason=write_error ...`：写盘失败。
+- `send CHUNK_ACK ...`：ACK 已发出。
 
-## 11. 与当前版本衔接
-- 当前 GUI 版本可先保留本地处理流程。
-- socket 协同先按本文档完成接口约定与状态机字段预留。
-- 后续可在 `services` 层新增 `dispatch_service` 与 `transfer_service` 实现在线节点调度。
+> 如果 Android 超时，但服务端没有 `recv RESULT_CHUNK`，先查双通道配对和读循环是否启动。  
+> 如果有 `recv` 但无 `send CHUNK_ACK`，重点查 `invalid_field/write_error`。
+
+## 7. 重连与恢复（当前实现）
+
+### 7.1 下发方向恢复（已实现）
+
+- 节点可发送 `TRANSFER_RESUME_REQUEST`（缺失 chunk 索引）。
+- 服务端补发缺失分片并重发 `TRANSFER_COMPLETE`。
+
+### 7.2 上传方向恢复（部分实现）
+
+- `HELLO_ACK.sync_actions` 已支持下发 `RESUME_UPLOAD`。
+- Android `TaskOrchestrator.resumeUpload(...)` 仍为 TODO（当前版本可能无法自动恢复上传）。
+- 现阶段建议：上传阶段断线后，由服务端/GUI 触发重派任务或人工重试。
+
+### 7.3 重连场景时序（控制通道异常）
+
+```mermaid
+sequenceDiagram
+    participant N as Android Node
+    participant S as Python SocketServer
+    participant D as DispatchService
+
+    Note over N,S: 运行中控制通道异常（如 Software caused connection abort）
+    N--xS: control socket broken
+    S->>S: session_closed / node offline
+    N->>N: 触发重连（双通道）
+    N->>S: connect control + data
+    N->>S: HELLO(currentTask snapshot)
+    S->>D: on_session_ready
+    D->>N: HELLO_ACK(sync_actions)
+    Note over N,D: 若 sync_actions 包含 QUERY_PROGRESS/RESUME_UPLOAD，按动作执行
+```
+
+## 8. 排障建议清单
+
+1. 先看服务端是否出现 `[protocol][pair_ready]` 与 `[protocol][data_loop_start]`。
+2. 再看 `TASK_ASSIGN -> TASK_CONFIRM -> CHUNK/CHUNK_ACK` 是否完整。
+3. 上传超时时，对照 `recv RESULT_CHUNK` 与 `send CHUNK_ACK` 是否成对。
+4. 出现 `Software caused connection abort` 时，优先检查服务端是否主动关闭（pair/hello timeout）。
+5. 检查同一节点是否同时存在旧连接残留（新版本已增加 pending_data 超时清理）。
+
+## 9. 当前限制与后续计划
+
+- 连接建立后，Android 侧对“运行期断线自动双通道重连”仍需增强（当前更偏首次连接重试）。
+- 上传恢复 `RESUME_UPLOAD` 需要补齐 Android 端实现。
+- 可考虑将 `peer_ip` 配对升级为带握手 token 的配对键，降低多网卡/IPv4-IPv6 场景错配概率。
 

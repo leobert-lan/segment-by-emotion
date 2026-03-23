@@ -68,6 +68,11 @@ class MediaNodeService : LifecycleService() {
     }
 
     private fun handleConnect(intent: Intent) {
+        if (orchestratorJob?.isActive == true) {
+            orchestratorJob?.cancel()
+            orchestratorJob = null
+        }
+
         val host = intent.getStringExtra(EXTRA_HOST) ?: return
         val controlPort = intent.getIntExtra(EXTRA_CONTROL_PORT, NodePreferences.DEFAULT_CONTROL_PORT)
         val dataPort = intent.getIntExtra(EXTRA_DATA_PORT, NodePreferences.DEFAULT_DATA_PORT)
