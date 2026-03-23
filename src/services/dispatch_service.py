@@ -640,13 +640,38 @@ class DispatchService:
         self, session: NodeSession, msg: MsgResultChunk, payload: bytes
     ) -> None:
         """接收结果分片，校验 hash，落盘，发送 CHUNK_ACK。"""
+        logger.info(
+            "recv RESULT_CHUNK taskId=%s transferId=%s chunkIndex=%d fileRole=%s payloadSize=%d",
+            msg.taskId,
+            msg.transferId,
+            msg.chunkIndex,
+            msg.fileRole,
+            msg.payloadSize,
+        )
+
+        if msg.payloadSize != len(payload):
+            logger.warning(
+                "drop message reason=invalid_field type=RESULT_CHUNK taskId=%s transferId=%s "
+                "chunkIndex=%d expectedPayloadSize=%d actualPayloadSize=%d",
+                msg.taskId,
+                msg.transferId,
+                msg.chunkIndex,
+                msg.payloadSize,
+                len(payload),
+            )
+            return
+
         actual_hash = hashlib.sha256(payload).hexdigest()
         if actual_hash != msg.chunkHash:
             logger.warning(
-                "结果分片 hash 不匹配: task=%s role=%s chunk=%d "
-                "expected=%s got=%s",
-                msg.taskId, msg.fileRole, msg.chunkIndex,
-                msg.chunkHash, actual_hash,
+                "drop message reason=invalid_field type=RESULT_CHUNK taskId=%s transferId=%s "
+                "chunkIndex=%d fileRole=%s expectedHash=%s actualHash=%s",
+                msg.taskId,
+                msg.transferId,
+                msg.chunkIndex,
+                msg.fileRole,
+                msg.chunkHash,
+                actual_hash,
             )
             return  # 不 ACK，等节点超时重传
 
@@ -659,7 +684,19 @@ class DispatchService:
             / msg.fileRole
         )
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, _write_chunk, chunk_dir, msg.chunkIndex, payload)
+        try:
+            await loop.run_in_executor(None, _write_chunk, chunk_dir, msg.chunkIndex, payload)
+        except Exception as exc:
+            logger.exception(
+                "drop message reason=write_error type=RESULT_CHUNK taskId=%s transferId=%s "
+                "chunkIndex=%d fileRole=%s error=%s",
+                msg.taskId,
+                msg.transferId,
+                msg.chunkIndex,
+                msg.fileRole,
+                exc,
+            )
+            return
 
         try:
             await session.send_data_frame(
@@ -668,6 +705,12 @@ class DispatchService:
                     transferId=msg.transferId,
                     chunkIndex=msg.chunkIndex,
                 ).to_dict()
+            )
+            logger.info(
+                "send CHUNK_ACK taskId=%s transferId=%s chunkIndex=%d",
+                msg.taskId,
+                msg.transferId,
+                msg.chunkIndex,
             )
             if msg.chunkIndex == 0:
                 _protocol_log(

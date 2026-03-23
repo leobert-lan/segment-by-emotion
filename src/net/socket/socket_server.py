@@ -174,6 +174,8 @@ class SocketServer:
             dr, dw = self._pending_data.pop(peer_ip)
             session.set_data(dr, dw)
             logger.debug("控制通道后配对 data: %s", peer_ip)
+            # data 先到达时，需在这里启动数据读取循环。
+            asyncio.create_task(self._run_data_when_ready(session, dr))
         else:
             self._pending_ctrl[peer_ip] = session
             # 等待数据通道配对
@@ -301,18 +303,7 @@ class SocketServer:
         except (asyncio.IncompleteReadError, ConnectionResetError, OSError):
             pass
         finally:
-            logger.info("节点断线: %s", session.node_id)
-            _protocol_log(
-                "session_closed",
-                "connection closed",
-                "client reconnect with both channels and HELLO",
-                node_id=session.node_id,
-                peer_ip=session.peer_ip,
-            )
-            session.close()
-            self._active.pop(session.node_id or "", None)
-            if self._on_session_closed:
-                self._on_session_closed(session)
+            await self._handle_session_disconnect(session, reason="control_channel_closed")
 
     # ── 数据通道处理 ──────────────────────────────────────────────────────────
 
@@ -336,6 +327,8 @@ class SocketServer:
             if peer_ip in self._pair_events:
                 self._pair_events[peer_ip].set()
             logger.debug("数据通道先配对 ctrl: %s", peer_ip)
+            # control 先到达时，在 data 侧启动数据读取循环。
+            await self._run_data_when_ready(session, reader)
         else:
             # 控制通道还没来，暂存
             self._pending_data[peer_ip] = (reader, writer)
@@ -349,29 +342,31 @@ class SocketServer:
             # 等待控制通道来取走（由控制通道侧 set_data 完成，此处无需再等）
             return
 
-        # 等待 session 就绪（node_id 由 HELLO 设置）
+    async def _run_data_when_ready(
+        self, session: NodeSession, reader: asyncio.StreamReader
+    ) -> None:
+        """在 session 有 node_id 后启动 data_loop，覆盖 control/data 先后到达两种路径。"""
         for _ in range(60):  # 最多等 6 秒
             if session.node_id is not None:
                 break
             await asyncio.sleep(0.1)
 
         if session.node_id is None:
-            logger.warning("数据通道等待 HELLO 超时: %s", peer_ip)
+            logger.warning("数据通道等待 HELLO 超时: %s", session.peer_ip)
             _protocol_log(
                 "data_wait_hello_timeout",
                 "data paired but node_id unresolved",
                 "control channel should send HELLO",
-                peer_ip=peer_ip,
+                peer_ip=session.peer_ip,
             )
             return
 
-        # 进入数据帧读取循环
         _protocol_log(
             "data_loop_start",
             "data channel ready",
             "receive CHUNK/RESULT frames",
             node_id=session.node_id,
-            peer_ip=peer_ip,
+            peer_ip=session.peer_ip,
         )
         await self._data_loop(session, reader)
 
@@ -388,6 +383,30 @@ class SocketServer:
             pass
         except Exception as exc:
             logger.exception("数据帧读取异常 %s: %s", session.node_id, exc)
+        finally:
+            await self._handle_session_disconnect(session, reason="data_channel_closed")
+
+    async def _handle_session_disconnect(self, session: NodeSession, reason: str) -> None:
+        """统一收敛断线处理，避免 control/data 双侧重复回调。"""
+        if session.status == "offline":
+            return
+
+        logger.info("节点断线: %s reason=%s", session.node_id, reason)
+        _protocol_log(
+            "session_closed",
+            f"{reason}",
+            "client reconnect with both channels and HELLO",
+            node_id=session.node_id,
+            peer_ip=session.peer_ip,
+        )
+        session.close()
+
+        node_id = session.node_id or ""
+        active_session = self._active.get(node_id)
+        if active_session is session:
+            self._active.pop(node_id, None)
+            if self._on_session_closed:
+                self._on_session_closed(session)
 
     # ── 内部 async 发送 ───────────────────────────────────────────────────────
 
