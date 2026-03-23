@@ -42,8 +42,8 @@ from src.net.socket.node_session import NodeSession
 
 logger = logging.getLogger(__name__)
 
-# 下载方向分片大小（SDS §7.1 建议 1MB）
-DOWNLOAD_CHUNK_SIZE = 1 * 1024 * 1024
+# 下载方向分片大小（8MB）
+DOWNLOAD_CHUNK_SIZE = 8 * 1024 * 1024
 # 等待单片 CHUNK_ACK 超时（秒）
 CHUNK_ACK_TIMEOUT = 30.0
 # 等待 TASK_CONFIRM 超时（秒）
