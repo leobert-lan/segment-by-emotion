@@ -33,6 +33,9 @@ import java.io.File
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
+// videoName is passed in from the task metadata via execute(); kept as a parameter
+// so MediaPipeline stays decoupled from VideoMeta/NodeTask.
+
 /**
  * Unified cut → merge → compress pipeline implemented as a **single Media3 Transformer pass**.
  *
@@ -73,12 +76,14 @@ class MediaPipeline(
      * Execute the full pipeline.
      *
      * @param taskId     Task identifier (used for directory layout)
+     * @param videoName  Original video file name (written into result.json)
      * @param params     Processing parameters from the Python server
      * @param onProgress (stage: String, progress: Float) — stage is "transcoding"
      * @return           The output video [File]
      */
     suspend fun execute(
         taskId: String,
+        videoName: String,
         params: ProcessingParams,
         onProgress: (stage: String, progress: Float) -> Unit,
     ): File {
@@ -124,8 +129,16 @@ class MediaPipeline(
         Log.i(TAG, "[$taskId] Encoder mime=$mimeType hw=${hevcChoice?.isHardware}")
 
         // Presentation effect scales each clip to targetHeight (aspect ratio preserved).
-        // Applied per-item so every clip in the sequence uses the same output dimensions.
-        val videoEffects: List<Effect> = listOf(Presentation.createForHeight(targetHeight))
+        // Skip if input is already at the target height — avoids unnecessary GPU scaling
+        // and may allow Transformer to skip the GL pipeline entirely.
+        val needsScaling = probe.heightPx != targetHeight
+        val videoEffects: List<Effect> = if (needsScaling) {
+            Log.d(TAG, "[$taskId] Scaling ${probe.heightPx}px → ${targetHeight}px (Presentation effect)")
+            listOf(Presentation.createForHeight(targetHeight))
+        } else {
+            Log.d(TAG, "[$taskId] No scaling needed (input already at ${targetHeight}px)")
+            emptyList()
+        }
 
         val editedMediaItems = interesting.mapIndexed { idx, seg ->
             Log.d(TAG, "[$taskId] Clip $idx: [${seg.startMs}–${seg.endMs}ms]")
@@ -163,9 +176,19 @@ class MediaPipeline(
         // Media3 Transformer.start() verifies it is called from the thread that
         // built the Transformer (applicationLooper). Building on main avoids the
         // IllegalStateException thrown when called from a looper-less IO thread.
+        //
+        // Audio notes:
+        //   • Audio tracks ARE included (no setRemoveAudio() call).
+        //   • ClippingConfiguration clips audio and video together for each segment.
+        //   • setAudioMimeType(AAC) forces re-encode to AAC, which is required for
+        //     multi-segment PTS concatenation (each segment's audio PTS starts from 0;
+        //     the sequence must stitch them continuously).
+        //   • Without explicit AAC, inputs with AC3/DTS/EAC3 (common in MKV/AVI)
+        //     may hit unsupported-codec paths on some devices.
         withContext(Dispatchers.Main) {
             val transformer = Transformer.Builder(context)
                 .setVideoMimeType(mimeType)
+                .setAudioMimeType(MimeTypes.AUDIO_AAC) // AAC: universally supported; required for multi-segment PTS stitching
                 .setEncoderFactory(encoderFactory)
                 .build()
 
@@ -222,6 +245,21 @@ class MediaPipeline(
         }
 
         Log.i(TAG, "[$taskId] Pipeline complete → ${resultFile.path}")
+
+        // ── Write result.json ─────────────────────────────────────────────
+        withContext(Dispatchers.IO) {
+            writeResultJson(
+                taskId           = taskId,
+                videoName        = videoName,
+                params           = params,
+                targetHeightPx   = targetHeight,
+                targetBitrateKbps = targetBitrateKbps,
+                mimeType         = mimeType,
+                resultVideoFile  = resultFile,
+                outputFile       = fileStore.resultJsonFile(taskId),
+            )
+        }
+
         return resultFile
     }
 }

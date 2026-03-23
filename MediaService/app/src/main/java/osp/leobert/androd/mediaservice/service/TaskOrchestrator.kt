@@ -1,14 +1,14 @@
 package osp.leobert.androd.mediaservice.service
 
-import android.content.Context
+import android.annotation.SuppressLint
 import android.util.Log
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 import osp.leobert.androd.mediaservice.domain.model.NodeTask
 import osp.leobert.androd.mediaservice.domain.model.ProcessingParams
 import osp.leobert.androd.mediaservice.domain.model.VideoMeta
@@ -18,9 +18,9 @@ import osp.leobert.androd.mediaservice.domain.state.TaskState
 import osp.leobert.androd.mediaservice.media.pipeline.MediaPipeline
 import osp.leobert.androd.mediaservice.net.protocol.ControlMessage
 import osp.leobert.androd.mediaservice.net.protocol.DataMessage
-import osp.leobert.androd.mediaservice.net.socket.DataChannelClient
 import osp.leobert.androd.mediaservice.net.socket.SocketConnectionManager
 import osp.leobert.androd.mediaservice.storage.db.AppDatabase
+import osp.leobert.androd.mediaservice.storage.entity.LocalTaskEntity
 import osp.leobert.androd.mediaservice.storage.file.FileStoreManager
 import osp.leobert.androd.mediaservice.storage.prefs.NodePreferences
 import java.time.Instant
@@ -33,7 +33,6 @@ import java.time.Instant
  * Cancel the coroutine to shut down cleanly.
  */
 class TaskOrchestrator(
-    private val context: Context,
     private val prefs: NodePreferences,
     private val db: AppDatabase,
     private val fileStore: FileStoreManager,
@@ -43,7 +42,6 @@ class TaskOrchestrator(
 
     companion object {
         private const val TAG = "TaskOrchestrator"
-        private const val CHUNK_SIZE_BYTES = 1 * 1024 * 1024  // 1 MB
     }
 
     private val _taskState = MutableStateFlow<TaskState>(TaskState.Idle)
@@ -52,11 +50,9 @@ class TaskOrchestrator(
     private var currentTask: NodeTask? = null
 
     suspend fun run() {
-        // Check for incomplete task from a previous session (cold-start recovery)
-        val pending = db.taskDao().getPendingTask()
+        val pending = withContext(Dispatchers.IO) { db.taskDao().getPendingTask() }
         if (pending != null) {
             Log.i(TAG, "Resuming incomplete task: ${pending.taskId}")
-            // Will send TRANSFER_RESUME_REQUEST after HELLO_ACK
         }
 
         val host = prefs.serverHost.first()
@@ -71,7 +67,6 @@ class TaskOrchestrator(
             return
         }
 
-        // Listen for HELLO_ACK and process sync_actions
         ctrl.incomingMessages.collect { msg ->
             when (msg) {
                 is ControlMessage.HelloAck -> handleHelloAck(msg)
@@ -91,11 +86,10 @@ class TaskOrchestrator(
                 else -> Log.w(TAG, "Unknown sync_action: ${action.action}")
             }
         }
-        if (ack.syncActions.isEmpty()) {
-            _taskState.value = TaskState.AwaitingTask
-        }
+        if (ack.syncActions.isEmpty()) _taskState.value = TaskState.AwaitingTask
     }
 
+    @SuppressLint("NewApi") // minSdk=31 > API 26 required by Instant.now()
     private suspend fun handleTaskAssign(msg: ControlMessage.TaskAssign) {
         val taskId = msg.taskId
         Log.i(TAG, "TASK_ASSIGN received: $taskId")
@@ -115,7 +109,24 @@ class TaskOrchestrator(
         )
         currentTask = NodeTask(taskId, meta, params)
 
-        // Confirm acceptance
+        // ── Persist task to Room for crash recovery ───────────────────────
+        val now = Instant.now().toString()
+        withContext(Dispatchers.IO) {
+            db.taskDao().upsert(
+                LocalTaskEntity(
+                    taskId = taskId,
+                    videoName = meta.videoName,
+                    fileSizeBytes = meta.fileSizeBytes,
+                    totalChunks = meta.totalChunks,
+                    fileHash = meta.fileHash,
+                    processingParamsJson = Json.encodeToString(msg.processingParams),
+                    status = "Receiving",
+                    createdAt = now,
+                    updatedAt = now,
+                )
+            )
+        }
+
         connectionManager.controlChannel?.send(
             ControlMessage.TaskConfirm(
                 requestId = java.util.UUID.randomUUID().toString(),
@@ -133,19 +144,22 @@ class TaskOrchestrator(
         meta: VideoMeta,
         params: ProcessingParams,
     ) {
-        // Data channel events drive progress; when TransferComplete arrives, run pipeline.
         connectionManager.dataChannel?.dataEvents?.collect { event ->
             when (event) {
                 is DataMessage.TransferComplete -> {
                     val assembled = runCatching {
-                        fileStore.assembleFile(taskId, meta.totalChunks)
+                        withContext(Dispatchers.IO) {
+                            fileStore.assembleFile(taskId, meta.totalChunks)
+                        }
                     }.getOrElse { e ->
                         _taskState.value = TaskState.Error(taskId, e.message ?: "Assembly failed", recoverable = false)
+                        dbError(taskId, e.message)
                         return@collect
                     }
-                    val hash = fileStore.sha256Hex(assembled)
+                    val hash = withContext(Dispatchers.IO) { fileStore.sha256Hex(assembled) }
                     if (hash != meta.fileHash) {
                         _taskState.value = TaskState.Error(taskId, "File hash mismatch", recoverable = false)
+                        dbError(taskId, "hash mismatch: expected ${meta.fileHash} got $hash")
                         return@collect
                     }
                     runProcessingAndUpload(taskId, params)
@@ -155,10 +169,17 @@ class TaskOrchestrator(
         }
     }
 
+    @SuppressLint("NewApi")
     private suspend fun runProcessingAndUpload(taskId: String, params: ProcessingParams) {
-        _taskState.value = TaskState.Processing(taskId, ProcessingStage.CUTTING, 0f)
+        dbStatus(taskId, "Processing")
+        _taskState.value = TaskState.Processing(taskId, ProcessingStage.TRANSCODING, 0f)
+
         val resultFile = runCatching {
-            pipeline.execute(taskId, params) { stage, progress ->
+            pipeline.execute(
+                taskId    = taskId,
+                videoName = currentTask?.videoMeta?.videoName ?: "unknown.mp4",
+                params    = params,
+            ) { stage, progress ->
                 val pipelineStage = when (stage) {
                     "cutting"     -> ProcessingStage.CUTTING
                     "merging"     -> ProcessingStage.MERGING
@@ -168,17 +189,54 @@ class TaskOrchestrator(
                 _taskState.value = TaskState.Processing(taskId, pipelineStage, progress)
             }
         }.getOrElse { e ->
+            Log.e(TAG, "[$taskId] Pipeline failed", e)
             _taskState.value = TaskState.Error(taskId, e.message ?: "Pipeline failed", recoverable = false)
+            dbError(taskId, e.message)
             return
         }
 
+        dbStatus(taskId, "Uploading")
         _taskState.value = TaskState.Uploading(taskId, 0f)
-        UploadManager(connectionManager.dataChannel!!, fileStore)
-            .upload(taskId, resultFile) { progress ->
-                _taskState.value = TaskState.Uploading(taskId, progress)
-            }
+
+        runCatching {
+            UploadManager(connectionManager.dataChannel!!, fileStore)
+                .upload(taskId, resultFile) { progress ->
+                    _taskState.value = TaskState.Uploading(taskId, progress)
+                }
+        }.onFailure { e ->
+            Log.e(TAG, "[$taskId] Upload failed", e)
+            _taskState.value = TaskState.Error(taskId, e.message ?: "Upload failed", recoverable = true)
+            dbError(taskId, e.message)
+            return
+        }
+
+        // ── Success: mark done, clean up local files ──────────────────────
         _taskState.value = TaskState.Done(taskId)
-        db.taskDao().updateStatus(taskId, "Done", Instant.now().toString())
+        withContext(Dispatchers.IO) {
+            runCatching {
+                // Delete task and its cascade-linked chunks from DB
+                db.taskDao().delete(taskId)
+                // Delete all files for this task (chunks, assembled.mp4, result.mp4, json)
+                fileStore.cleanTask(taskId)
+                Log.i(TAG, "[$taskId] Task files and DB record cleaned up")
+            }.onFailure { e ->
+                Log.w(TAG, "[$taskId] Cleanup failed (non-fatal): ${e.message}")
+            }
+        }
+    }
+
+    // ── DB helpers ────────────────────────────────────────────────────────
+
+    @SuppressLint("NewApi")
+    private suspend fun dbStatus(taskId: String, status: String) = withContext(Dispatchers.IO) {
+        runCatching { db.taskDao().updateStatus(taskId, status, Instant.now().toString()) }
+    }
+
+    @SuppressLint("NewApi")
+    private suspend fun dbError(taskId: String, message: String?) = withContext(Dispatchers.IO) {
+        runCatching {
+            db.taskDao().updateStatusWithError(taskId, "Error", message, Instant.now().toString())
+        }
     }
 
     private suspend fun handleStatusQuery(msg: ControlMessage.TaskStatusQuery) {
@@ -188,9 +246,9 @@ class TaskOrchestrator(
             taskId = msg.taskId,
             status = state::class.simpleName ?: "Unknown",
             progress = when (state) {
-                is TaskState.Receiving -> state.progress
+                is TaskState.Receiving  -> state.progress
                 is TaskState.Processing -> state.progress
-                is TaskState.Uploading -> state.progress
+                is TaskState.Uploading  -> state.progress
                 else -> 0f
             },
             stage = (state as? TaskState.Processing)?.stage?.name,
@@ -198,18 +256,11 @@ class TaskOrchestrator(
         connectionManager.controlChannel?.send(report)
     }
 
-    private suspend fun reportProgress(taskId: String) {
-        handleStatusQuery(
-            ControlMessage.TaskStatusQuery(
-                requestId = java.util.UUID.randomUUID().toString(),
-                taskId = taskId,
-            )
-        )
-    }
+    private suspend fun reportProgress(taskId: String) = handleStatusQuery(
+        ControlMessage.TaskStatusQuery(requestId = java.util.UUID.randomUUID().toString(), taskId = taskId)
+    )
 
-    private suspend fun resumeUpload(taskId: String) {
-        // TODO: implement resume upload from staged result files
-        Log.i(TAG, "Resume upload requested for $taskId")
+    private fun resumeUpload(taskId: String) {
+        Log.i(TAG, "Resume upload requested for $taskId — TODO: implement")
     }
 }
-

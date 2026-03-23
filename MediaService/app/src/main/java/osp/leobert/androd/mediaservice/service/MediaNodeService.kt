@@ -110,10 +110,11 @@ class MediaNodeService : LifecycleService() {
         )
 
         val pipeline = MediaPipeline(applicationContext, fileStore)
-        val orchestrator = TaskOrchestrator(applicationContext, prefs, db, fileStore, connectionManager, pipeline)
+        val orchestrator = TaskOrchestrator(prefs, db, fileStore, connectionManager, pipeline)
 
-        // Mirror state changes to the notification
+        // Mirror state → NodeStateHolder (read by NodeStatusViewModel) AND notification
         orchestrator.taskState.onEach { state ->
+            NodeStateHolder.update(state)
             notificationManager.notify(NOTIFICATION_ID, buildNotification(state))
         }.launchIn(lifecycleScope)
 
@@ -123,6 +124,7 @@ class MediaNodeService : LifecycleService() {
     private fun handleDisconnect() {
         orchestratorJob?.cancel()
         orchestratorJob = null
+        NodeStateHolder.update(TaskState.Idle)
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }

@@ -1,0 +1,307 @@
+@startuml android_node_full_sequence
+title Android 节点 ↔ Python 服务端完整通信时序\n（正常流 + 关键异常路径）
+
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+skinparam maxMessageSize 240
+skinparam ParticipantPadding 10
+skinparam BoxPadding 8
+
+skinparam sequence {
+  GroupBodyBackgroundColor #FAFAFA
+  GroupBorderColor #AAAAAA
+  LifeLineBorderColor #666666
+  LifeLineBackgroundColor #EEEEEE
+  ArrowColor #333333
+  ActorBorderColor #333333
+}
+
+' ─────────────────────────────────────────────────────────────────────
+' 参与者
+' ─────────────────────────────────────────────────────────────────────
+participant "Python 服务端\n(TaskServer)" as S #ADD8E6
+
+box "Android 节点进程" #FFFFF0
+  participant "MediaNodeService\n(LifecycleService)" as SVC #90EE90
+  participant "SocketConnection\nManager" as CM #FFFACD
+  participant "ControlChannel\nClient :23010" as CC #FFDEAD
+  participant "DataChannel\nClient :23011" as DC #FFDEAD
+  participant "TaskOrchestrator" as TO #E6E6FA
+  participant "FileStoreManager\n+ Room DB" as FS #D3D3D3
+  participant "MediaPipeline\n(Transformer)" as MP #FFB6C1
+  participant "UploadManager" as UM #B0E0E6
+  participant "NodeStateHolder\n→ UI / 通知" as UI #98FB98
+end box
+
+' ─────────────────────────────────────────────────────────────────────
+== ① 双通道建立 ==
+' ─────────────────────────────────────────────────────────────────────
+
+[-> SVC : ACTION_CONNECT\n(host, controlPort=23010, dataPort=23011)
+activate SVC #90EE90
+
+SVC -> CM : connectWithRetry()
+activate CM #FFFACD
+
+CM -> CC : connect()
+activate CC #FFDEAD
+CC -> S : TCP SYN → :23010
+S --> CC : TCP ACK
+CC -> S : **HELLO** (control, JSON+newline)\n{"type":"HELLO","node_id":"android-001",\n"node_version":"1.0.0",\n"capabilities":{"gpu":true,"codec":["hevc","avc"]},\n"current_task":null}
+deactivate CC
+
+CM -> DC : connect()
+activate DC #FFDEAD
+DC -> S : TCP SYN → :23011
+S --> DC : TCP ACK
+note over CM,DC : 双通道均就绪\n→ ConnectionState.Ready
+deactivate DC
+
+CM --> SVC : 连接就绪
+deactivate CM
+
+SVC -> TO : lifecycleScope.launch { orchestrator.run() }
+activate TO #E6E6FA
+
+' ─────────────────────────────────────────────────────────────────────
+== ② 握手与状态同步 ==
+' ─────────────────────────────────────────────────────────────────────
+
+S -> CC : **HELLO_ACK** (control)\n{"type":"HELLO_ACK","server_time":"2026-03-23T…",\n"sync_actions":[]}
+CC -> TO : incomingMessages.emit(HelloAck)
+TO -> UI : TaskState.AwaitingTask
+UI --> UI : 通知："已连接，等待任务下发"
+
+note over S,TO #FFE0D0
+  **异常路径 A — 崩溃恢复（sync_actions 非空）**
+  ┌─ RESUME_UPLOAD  → UploadManager 续传已生成的结果文件
+  └─ QUERY_PROGRESS → 发送 TASK_STATUS_REPORT{status, progress, stage}
+end note
+
+' ─────────────────────────────────────────────────────────────────────
+== ③ 任务下发 ==
+' ─────────────────────────────────────────────────────────────────────
+
+S -> CC : **TASK_ASSIGN** (control)\n{"type":"TASK_ASSIGN",\n"task_id":"t-0042",\n"video_meta":{"video_name":"talk.mkv",\n  "file_size_bytes":734003200,\n  "total_chunks":700,\n  "file_hash":"sha256:abcd…"},\n"processing_params":{"segments":[\n  {"start_ms":5000,"end_ms":18000,"label":"interesting"},\n  {"start_ms":42000,"end_ms":61000,"label":"interesting"},\n  {"start_ms":90000,"end_ms":95000,"label":"uninteresting"}],\n  "codec_hint":"hevc","target_bitrate_kbps":0},\n"result_requirements":{"include_result_json":true}}
+
+CC -> TO : incomingMessages.emit(TaskAssign)
+
+TO -> FS : db.taskDao().upsert(\n  LocalTaskEntity{taskId, videoName, totalChunks,\n  fileHash, status="Receiving", createdAt})
+FS --> TO : OK (崩溃恢复锚点)
+
+TO -> CC : **TASK_CONFIRM** (control)\n{"type":"TASK_CONFIRM","task_id":"t-0042","accepted":true}
+CC -> S : TASK_CONFIRM
+
+TO -> UI : TaskState.Receiving("t-0042", "talk.mkv", 0f)
+UI --> UI : 通知："接收视频 — talk.mkv [不确定进度条]"
+
+' ─────────────────────────────────────────────────────────────────────
+== ④ 视频下载（1 MB 分片） ==
+' ─────────────────────────────────────────────────────────────────────
+
+note over S,DC #E0F0FF
+  **数据帧格式（:23011）**
+  ┌──────────────┬────────────────────┬─────────────────────┐
+  │ 4B (Big-End) │  JSON header (UTF-8)│  binary payload     │
+  │ header 长度  │  chunk_index 等字段 │  ≤ 8 388 608 bytes  │
+  └──────────────┴────────────────────┴─────────────────────┘
+  分片大小 8 MB（上传由 UploadManager.CHUNK_SIZE 控制；下载由 Python 服务端控制）
+end note
+
+S -> DC : **CHUNK** [frame #0]\n header:{task_id,transfer_id,\n chunk_index:0,chunk_hash:"h0",\n payload_size:8388608}\n + [8 MB binary payload]
+activate DC #FFDEAD
+
+DC -> FS : writeChunkPayload("t-0042", 0, bytes)\nchunkDao.markReceived("t-0042", 0)
+FS --> DC : 落盘 tasks/t-0042/chunks/chunk_0.bin
+DC -> S : **CHUNK_ACK** [frame]\n{task_id,transfer_id,chunk_index:0}
+deactivate DC
+
+note over S,DC #CCDDFF
+  **循环 chunk_index = 1 … 697**
+  (同上，每片 8 MB / 每片一次 CHUNK_ACK)
+  接收进度 = (已收片数 / 88) × 100%  ← 700 MB / 8 MB ≈ 88 片
+end note
+
+S -> DC : **CHUNK** [frame #699]\n header:{chunk_index:699,\n payload_size:remainder_bytes}\n + [最后一片 payload]
+activate DC #FFDEAD
+DC -> FS : writeChunkPayload("t-0042", 699, bytes)\nchunkDao.markReceived("t-0042", 699)
+FS --> DC : OK
+DC -> S : **CHUNK_ACK** {chunk_index:699}
+deactivate DC
+
+S -> DC : **TRANSFER_COMPLETE** [frame]\n{task_id,transfer_id,\n total_hash:"sha256:full…"}
+DC -> TO : dataEvents.emit(TransferComplete)
+
+TO -> FS : fileStore.assembleFile("t-0042", 700)\n[按 chunk_index 顺序拼接 700 个 .bin 文件]
+FS --> TO : assembled.mp4 (700 MB)
+
+TO -> FS : sha256Hex(assembled.mp4)
+FS --> TO : computed_hash
+
+alt computed_hash == total_hash ✓
+  TO -> TO : 校验通过 → 进入处理阶段
+else computed_hash ≠ total_hash ✗
+  TO -> UI : TaskState.Error("File hash mismatch", recoverable=false)
+  UI --> UI : 通知："错误 — 文件校验失败"
+  note over TO #FFD0D0 : 任务终止\n文件保留供调试\nDB 状态置 "Error"
+end
+
+note over S,DC #FFE0D0
+  **异常路径 B — 传输中断后续传**
+  1. readLoop catch IOException → 通道关闭
+  2. connectWithRetry() 退避重连：1s→2s→4s→…→60s
+  3. 重连后发 HELLO（含 current_task 快照）
+  4. HELLO_ACK 无 sync_actions
+  5. 节点发 **TRANSFER_RESUME_REQUEST**
+     {task_id, transfer_id, missing_indices:[已缺失的 chunk_index 列表]}
+  6. 服务端仅补发缺失分片 → 恢复正常 CHUNK 流程
+end note
+
+' ─────────────────────────────────────────────────────────────────────
+== ⑤ 媒体处理（单次 Transformer Composition 转码） ==
+' ─────────────────────────────────────────────────────────────────────
+
+TO -> FS : db.taskDao().updateStatus("Processing")
+TO -> UI : TaskState.Processing(TRANSCODING, 0f)
+UI --> UI : 通知："处理中 — transcoding [进度条]"
+
+TO -> MP : pipeline.execute(\n  taskId="t-0042",\n  videoName="talk.mkv",\n  params, onProgress)
+activate MP #FFB6C1
+
+note over MP #FFFFF0
+  **MediaPipeline 内部处理流程**
+
+  [IO 线程]
+  1. 过滤 label == "interesting" 的片段
+     → 片段 0 [5000–18000ms] + 片段 1 [42000–61000ms]
+     → 片段 2 [90000–95000ms] 跳过 (uninteresting)
+
+  2. VideoMetaProber.probe(assembled.mp4)
+     → 宽:1280 高:720 码率:800kbps
+
+  3. ResolutionPolicy.targetHeight(1280, 720)
+     → 720 (已是标准档位，无需缩放)
+
+  4. BitratePolicy.computeKbps(720, 800kbps, override=0)
+     → min(2500, 800) = 800 kbps
+
+  5. HardwareCodecSelector.selectEncoder("video/hevc")
+     → c2.qti.hevc.encoder (Snapdragon 880 HW)
+
+  [切换至主线程]
+  6. 构建 EditedMediaItemSequence:
+     EditedMediaItem[0]{uri, ClipConfig[5000–18000ms], Effects[]}
+     EditedMediaItem[1]{uri, ClipConfig[42000–61000ms], Effects[]}
+     → 不加 Presentation Effect（输入已是目标分辨率）
+
+  7. Composition{sequence} → Transformer.start(composition, result.mp4)
+     ExoPlayer extractor (支持 MKV/AVI/FLV) → MediaCodec HW 解码
+     → MediaCodec c2.qti.hevc.encoder HW 编码 @ 800kbps
+end note
+
+loop 每 500ms（主线程 Handler 轮询）
+  MP -> MP : transformer.getProgress(progressHolder)
+  MP --> TO : onProgress("transcoding", p ∈ [0,1])
+  TO -> UI : TaskState.Processing(TRANSCODING, p)
+end
+
+MP -> FS : writeResultJson("t-0042", "talk.mkv", params,\n  720, 800, "video/hevc",\n  result.mp4, result.json)
+note right of FS
+  result.json 内容（schema v1）：
+  { "schema_version":"v1",
+    "task":{"id":"t-0042","video_name":"talk.mkv"},
+    "summary":{"total_segments_received":3,
+               "interesting_count":2,"skipped_count":1},
+    "processed_segments":[
+      {"start_ms":5000,"end_ms":18000,...},
+      {"start_ms":42000,"end_ms":61000,...}],
+    "output":{"file_size_bytes":14745600,
+              "target_height_px":720,
+              "target_bitrate_kbps":800,
+              "mime_type":"video/hevc"},
+    "processed_at_ms":1742688000000 }
+end note
+
+MP --> TO : result.mp4 (File)
+deactivate MP
+
+TO -> UI : onProgress("transcoding", 1f)
+UI --> UI : 通知进度 100%
+
+' ─────────────────────────────────────────────────────────────────────
+== ⑥ 结果回传 ==
+' ─────────────────────────────────────────────────────────────────────
+
+TO -> FS : db.taskDao().updateStatus("Uploading")
+TO -> UI : TaskState.Uploading("t-0042", 0f)
+UI --> UI : 通知："上传结果 — t-0042"
+
+TO -> UM : upload("t-0042", result.mp4, onProgress)
+activate UM #B0E0E6
+
+note over UM,DC #E0FFE0
+  **上传顺序**：result.mp4 (role="video") → result.json (role="json")
+  共用同一 transfer_id；每片 ≤ 1 MB；先订阅 ChunkAck 再发送（防竞态）
+end note
+
+group 上传 result.mp4（共 M 片，role="video"）
+  loop chunk_index = 0 … M-1
+    UM -> DC : async(UNDISPATCHED):\n  dataEvents.first { ChunkAck && idx==i }\n  [先注册订阅，再发送]
+    UM -> DC : **RESULT_CHUNK** [frame]\n{task_id,transfer_id,chunk_index:i,\n chunk_hash,payload_size,file_role:"video"}\n + [≤8 MB binary]
+    DC -> S : 帧转发 :23011
+    S --> DC : **CHUNK_ACK**\n{task_id,transfer_id,chunk_index:i}
+    DC -> UM : dataEvents.emit(ChunkAck)
+    UM -> UM : ackDeferred.complete → 继续下一片
+    note right of UM : 超时 30s 未收 ACK\n→ IOException\n→ Error(recoverable=true)
+  end
+end
+
+group 上传 result.json（共 K 片，role="json"，如文件存在）
+  loop chunk_index = 0 … K-1
+    UM -> DC : async(UNDISPATCHED): dataEvents.first{ChunkAck,idx==i}
+    UM -> DC : **RESULT_CHUNK** {file_role:"json"} + [payload]
+    DC -> S : 帧转发
+    S --> DC : CHUNK_ACK {chunk_index:i}
+    DC -> UM : dataEvents.emit(ChunkAck)
+  end
+end
+
+UM -> DC : **RESULT_TRANSFER_COMPLETE** [frame]\n{task_id,transfer_id,total_hash:"sha256:xyz…"}
+DC -> S : 帧转发
+UM --> TO : upload 完成
+deactivate UM
+
+' ─────────────────────────────────────────────────────────────────────
+== ⑦ 完成与本地清理 ==
+' ─────────────────────────────────────────────────────────────────────
+
+TO -> UI : TaskState.Done("t-0042")
+UI --> UI : 通知："处理完成 ✓" [进度 100%]
+
+TO -> FS : db.taskDao().delete("t-0042")\n[CASCADE 删除 transfer_chunks 表记录]
+TO -> FS : fileStore.cleanTask("t-0042")\n删除 filesDir/tasks/t-0042/\n├── chunks/chunk_0.bin … chunk_699.bin\n├── assembled.mp4\n├── output/result_t-0042.mp4\n└── result.json
+
+deactivate TO
+deactivate SVC
+
+S -> S : 校验 total_hash\n更新任务状态 → "done"\n落盘 data/node_results/t-0042/\n{result.json, result_t-0042.mp4}
+
+' ─────────────────────────────────────────────────────────────────────
+== 附：主要状态转换一览 ==
+' ─────────────────────────────────────────────────────────────────────
+
+note over TO,UI #F5F5F5
+  **TaskState 转换链**
+  Idle
+    → Connecting(host, controlPort, dataPort)   [ACTION_CONNECT 触发]
+    → AwaitingTask                               [HELLO_ACK 无 sync_actions]
+    → Receiving(taskId, videoName, progress)     [TASK_ASSIGN 后]
+    → Processing(taskId, TRANSCODING, progress)  [assembleFile + hash 验证通过]
+    → Uploading(taskId, progress)                [pipeline.execute 完成]
+    → Done(taskId)                               [upload 完成]
+    → Error(taskId?, reason, recoverable)        [任意阶段失败]
+    → Idle                                       [ACTION_DISCONNECT]
+end note
+
+@enduml
+
