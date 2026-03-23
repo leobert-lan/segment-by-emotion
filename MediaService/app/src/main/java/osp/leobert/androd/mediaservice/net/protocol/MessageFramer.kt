@@ -1,6 +1,8 @@
 package osp.leobert.androd.mediaservice.net.protocol
 
-import kotlinx.serialization.json.Json
+import com.google.gson.Gson
+import com.google.gson.JsonObject
+import com.google.gson.JsonParser
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.InputStream
@@ -14,19 +16,17 @@ import java.io.OutputStream
  */
 object MessageFramer {
 
-    private val json = Json {
-        classDiscriminator = "type"
-        ignoreUnknownKeys = true
-        encodeDefaults = true
-    }
+    private val gson = Gson()
 
     // ── Control channel ───────────────────────────────────────────────────
 
     fun encodeControl(message: ControlMessage): String =
-        json.encodeToString(ControlMessage.serializer(), message) + "\n"
+        gson.toJson(message) + "\n"
 
-    fun decodeControl(line: String): ControlMessage =
-        json.decodeFromString(ControlMessage.serializer(), line.trim())
+    fun decodeControl(line: String): ControlMessage {
+        val json = JsonParser.parseString(line.trim()).asJsonObject
+        return parseControlMessage(json)
+    }
 
     // ── Data channel ──────────────────────────────────────────────────────
 
@@ -35,7 +35,7 @@ object MessageFramer {
      * [payload] may be null for messages with payloadSize == 0.
      */
     fun writeDataFrame(out: OutputStream, message: DataMessage, payload: ByteArray? = null) {
-        val headerBytes = json.encodeToString(DataMessage.serializer(), message).toByteArray(Charsets.UTF_8)
+        val headerBytes = gson.toJson(message).toByteArray(Charsets.UTF_8)
         val dos = DataOutputStream(out)
         dos.writeInt(headerBytes.size)
         dos.write(headerBytes)
@@ -54,7 +54,8 @@ object MessageFramer {
         val headerLen = dis.readInt()
         val headerBytes = ByteArray(headerLen)
         dis.readFully(headerBytes)
-        return json.decodeFromString(DataMessage.serializer(), headerBytes.decodeToString())
+        val json = JsonParser.parseString(headerBytes.decodeToString()).asJsonObject
+        return parseDataMessage(json)
     }
 
     /**
@@ -66,5 +67,35 @@ object MessageFramer {
         DataInputStream(inp).readFully(buf)
         return buf
     }
-}
 
+    private fun parseControlMessage(json: JsonObject): ControlMessage {
+        return when (json.getRequiredString("type")) {
+            "HELLO" -> gson.fromJson(json, ControlMessage.Hello::class.java)
+            "TASK_STATUS_REPORT" -> gson.fromJson(json, ControlMessage.TaskStatusReport::class.java)
+            "TASK_CONFIRM" -> gson.fromJson(json, ControlMessage.TaskConfirm::class.java)
+            "HELLO_ACK" -> gson.fromJson(json, ControlMessage.HelloAck::class.java)
+            "TASK_ASSIGN" -> gson.fromJson(json, ControlMessage.TaskAssign::class.java)
+            "TASK_STATUS_QUERY" -> gson.fromJson(json, ControlMessage.TaskStatusQuery::class.java)
+            else -> throw IllegalArgumentException("Unknown control message type=${json.getRequiredString("type")}")
+        }
+    }
+
+    private fun parseDataMessage(json: JsonObject): DataMessage {
+        return when (json.getRequiredString("type")) {
+            "CHUNK" -> gson.fromJson(json, DataMessage.Chunk::class.java)
+            "TRANSFER_COMPLETE" -> gson.fromJson(json, DataMessage.TransferComplete::class.java)
+            "CHUNK_ACK" -> gson.fromJson(json, DataMessage.ChunkAck::class.java)
+            "TRANSFER_RESUME_REQUEST" -> gson.fromJson(json, DataMessage.TransferResumeRequest::class.java)
+            "RESULT_CHUNK" -> gson.fromJson(json, DataMessage.ResultChunk::class.java)
+            "RESULT_TRANSFER_COMPLETE" -> gson.fromJson(json, DataMessage.ResultTransferComplete::class.java)
+            else -> throw IllegalArgumentException("Unknown data message type=${json.getRequiredString("type")}")
+        }
+    }
+
+    private fun JsonObject.getRequiredString(key: String): String {
+        if (!has(key) || get(key).isJsonNull) {
+            throw IllegalArgumentException("Missing required field '$key'")
+        }
+        return get(key).asString
+    }
+}
