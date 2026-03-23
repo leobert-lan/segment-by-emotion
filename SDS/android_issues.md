@@ -137,3 +137,40 @@ UploadManager 没等 ChunkAck
 高
 有 TODO，上传可靠性存疑
 要我优先处理哪个？建议从最高优先级的 状态流接通 + 任务完成清理 开始。
+
+
+[392228a] readLoop exit
+2026-03-23 22:24:54.224 18100-27276 ControlChannelClient    osp.leobert.androd.mediaservice      W  [3110969] readLoop exception error=Software caused connection abort (Fix with AI)
+java.net.SocketException: Software caused connection abort
+at java.net.SocketInputStream.socketRead0(Native Method)
+at java.net.SocketInputStream.socketRead(SocketInputStream.java:118)
+at java.net.SocketInputStream.read(SocketInputStream.java:173)
+at java.net.SocketInputStream.read(SocketInputStream.java:143)
+at sun.nio.cs.StreamDecoder.readBytes(StreamDecoder.java:291)
+at sun.nio.cs.StreamDecoder.implRead(StreamDecoder.java:355)
+at sun.nio.cs.StreamDecoder.read(StreamDecoder.java:181)
+at java.io.InputStreamReader.read(InputStreamReader.java:180)
+at java.io.BufferedReader.fill(BufferedReader.java:172)
+at java.io.BufferedReader.readLine(BufferedReader.java:337)
+at java.io.BufferedReader.readLine(BufferedReader.java:403)
+at osp.leobert.androd.mediaservice.net.socket.ControlChannelClient.readLoop(ControlChannelClient.kt:101)
+at osp.leobert.androd.mediaservice.net.socket.ControlChannelClient.access$readLoop(ControlChannelClient.kt:29)
+at osp.leobert.androd.mediaservice.net.socket.ControlChannelClient$connect$2$1.invokeSuspend(ControlChannelClient.kt:65)
+at kotlin.coroutines.jvm.internal.BaseContinuationImpl.resumeWith(ContinuationImp[392228a] readLoop exit
+2026-03-23 22:24:54.224 18100-27276 ControlChannelClient    osp.leobert.androd.mediaservice      W  [3110969] readLoop exception error=Software caused connection abort (Fix with AI)
+java.net.SocketException: Software caused connection abort
+at java.net.SocketInputStream.socketRead0(Native Method)
+at java.net.SocketInputStream.socketRead(SocketInputStream.java:118)
+at java.net.SocketInputStream.read(SocketInputStream.java:173)
+at java.net.SocketInputStream.read(SocketInputStream.java:143)
+at sun.nio.cs.StreamDecoder.readBytes(StreamDecoder.java:291)
+at sun.nio.cs.StreamDecoder.implRead(StreamDecoder.java:355)
+at sun.nio.cs.StreamDecoder.read(StreamDecoder.java:181)
+at java.io.InputStreamReader.read(InputStreamReader.java:180)
+at java.io.BufferedReader.fill(BufferedReader.java:172)
+at java.io.BufferedReader.readLine(BufferedReader.java:337)
+at java.io.BufferedReader.readLine(BufferedReader.java:403)
+at osp.leobert.androd.mediaservice.net.socket.ControlChannelClient.readLoop(ControlChannelClient.kt:101)
+at osp.leobert.androd.mediaservice.net.socket.ControlChannelClient.access$readLoop(ControlChannelClient.kt:29)
+at osp.leobert.androd.mediaservice.net.socket.ControlChannelClient$connect$2$1.invokeSuspend(ControlChannelClient.kt:65)
+at kotlin.coroutines.jvm.internal.BaseContinuationImpl.resumeWith(ContinuationImp

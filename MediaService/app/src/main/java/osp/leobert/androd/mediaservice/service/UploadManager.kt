@@ -127,6 +127,11 @@ class UploadManager(
                         }
                     }
 
+                    Log.d(
+                        TAG,
+                        "[$taskId] upload send role=$role chunk=$idx size=$read transferId=$transferId",
+                    )
+
                     dataChannel.writeDataFrame(
                         DataMessage.ResultChunk(
                             taskId     = taskId,
@@ -139,13 +144,27 @@ class UploadManager(
                         payload,
                     )
 
-                    withTimeoutOrNull(ACK_TIMEOUT_MS) { ackDeferred.await() }
-                        ?: run {
-                            ackDeferred.cancel()
-                            throw IOException(
-                                "[$taskId] Timeout waiting for ChunkAck: role=$role chunk=$idx"
-                            )
-                        }
+                    val waitStartNs = System.nanoTime()
+                    val ack = withTimeoutOrNull(ACK_TIMEOUT_MS) {
+                        ackDeferred.await()
+                    } as? DataMessage.ChunkAck
+
+                    if (ack == null) {
+                        ackDeferred.cancel()
+                        Log.w(
+                            TAG,
+                            "[$taskId] upload ack timeout role=$role chunk=$idx transferId=$transferId",
+                        )
+                        throw IOException(
+                            "[$taskId] Timeout waiting for ChunkAck: role=$role chunk=$idx"
+                        )
+                    }
+
+                    val waitedMs = (System.nanoTime() - waitStartNs) / 1_000_000L
+                    Log.d(
+                        TAG,
+                        "[$taskId] upload ack role=$role chunk=$idx waitedMs=$waitedMs transferId=${ack.transferId}",
+                    )
                 }
 
                 chunkIndex++

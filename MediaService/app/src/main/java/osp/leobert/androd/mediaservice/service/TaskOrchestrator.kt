@@ -145,29 +145,53 @@ class TaskOrchestrator(
         meta: VideoMeta,
         params: ProcessingParams,
     ) {
-        connectionManager.dataChannel?.dataEvents?.collect { event ->
+        val dataEvents = connectionManager.dataChannel?.dataEvents ?: run {
+            _taskState.value = TaskState.Error(taskId, "Data channel unavailable", recoverable = true)
+            return
+        }
+
+        var maxChunkIndex = -1
+        while (true) {
+            val event = dataEvents.first { msg ->
+                when (msg) {
+                    is DataMessage.Chunk -> msg.taskId == taskId
+                    is DataMessage.TransferComplete -> msg.taskId == taskId
+                    else -> false
+                }
+            }
             when (event) {
+                is DataMessage.Chunk -> {
+                    if (event.chunkIndex > maxChunkIndex) {
+                        maxChunkIndex = event.chunkIndex
+                        val progress = ((maxChunkIndex + 1).toFloat() / meta.totalChunks)
+                            .coerceIn(0f, 0.999f)
+                        _taskState.value = TaskState.Receiving(taskId, meta.videoName, progress)
+                    }
+                }
                 is DataMessage.TransferComplete -> {
-                    val assembled = runCatching {
-                        withContext(Dispatchers.IO) {
-                            fileStore.assembleFile(taskId, meta.totalChunks)
-                        }
-                    }.getOrElse { e ->
-                        _taskState.value = TaskState.Error(taskId, e.message ?: "Assembly failed", recoverable = false)
-                        dbError(taskId, e.message)
-                        return@collect
-                    }
-                    val hash = withContext(Dispatchers.IO) { fileStore.sha256Hex(assembled) }
-                    if (hash != meta.fileHash) {
-                        _taskState.value = TaskState.Error(taskId, "File hash mismatch", recoverable = false)
-                        dbError(taskId, "hash mismatch: expected ${meta.fileHash} got $hash")
-                        return@collect
-                    }
-                    runProcessingAndUpload(taskId, params)
+                    Log.i(TAG, "[$taskId] Transfer complete received, starting assemble")
+                    break
                 }
                 else -> Unit
             }
         }
+
+        val assembled = runCatching {
+            withContext(Dispatchers.IO) {
+                fileStore.assembleFile(taskId, meta.totalChunks)
+            }
+        }.getOrElse { e ->
+            _taskState.value = TaskState.Error(taskId, e.message ?: "Assembly failed", recoverable = false)
+            dbError(taskId, e.message)
+            return
+        }
+        val hash = withContext(Dispatchers.IO) { fileStore.sha256Hex(assembled) }
+        if (hash != meta.fileHash) {
+            _taskState.value = TaskState.Error(taskId, "File hash mismatch", recoverable = false)
+            dbError(taskId, "hash mismatch: expected ${meta.fileHash} got $hash")
+            return
+        }
+        runProcessingAndUpload(taskId, params)
     }
 
     @SuppressLint("NewApi")

@@ -106,6 +106,7 @@ class DataChannelClient(
                         val payload = MessageFramer.readPayload(inp, header.payloadSize)
                         val ok = onChunkReceived(header, payload)
                         Log.d(TAG, "[$connId] chunk store result chunk=${header.chunkIndex} ok=$ok")
+                        emitDataEvent(header)
                         if (ok) {
                             writeDataFrame(
                                 DataMessage.ChunkAck(
@@ -124,7 +125,7 @@ class DataChannelClient(
                                 "transferId=${header.transferId}",
                         )
                         onTransferComplete(header)
-                        _dataEvents.emit(header)
+                        emitDataEvent(header)
                     }
                     else -> {
                         val payloadSize = when (header) {
@@ -133,9 +134,18 @@ class DataChannelClient(
                             is DataMessage.TransferResumeRequest -> header.payloadSize
                             is DataMessage.ResultChunk -> header.payloadSize
                         }
-                        Log.d(TAG, "[$connId] recv ${header.type} payload=$payloadSize")
+                        when (header) {
+                            is DataMessage.ChunkAck -> {
+                                Log.d(
+                                    TAG,
+                                    "[$connId] recv CHUNK_ACK taskId=${header.taskId} " +
+                                        "transferId=${header.transferId} chunk=${header.chunkIndex}",
+                                )
+                            }
+                            else -> Log.d(TAG, "[$connId] recv ${header.type} payload=$payloadSize")
+                        }
                         MessageFramer.readPayload(inp, payloadSize)
-                        _dataEvents.emit(header)
+                        emitDataEvent(header)
                     }
                 }
             }
@@ -144,6 +154,15 @@ class DataChannelClient(
             Log.w(TAG, "[$connId] readLoop exception error=${e.message}", e)
         } finally {
             Log.d(TAG, "[$connId] readLoop exit")
+        }
+    }
+
+    private suspend fun emitDataEvent(event: DataMessage) {
+        val startNs = System.nanoTime()
+        _dataEvents.emit(event)
+        val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
+        if (elapsedMs > 200) {
+            Log.w(TAG, "[$connId] dataEvents emit blocked ${elapsedMs}ms type=${event.type}")
         }
     }
 }
