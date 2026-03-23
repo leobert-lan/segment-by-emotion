@@ -42,12 +42,18 @@ from src.net.socket.node_session import NodeSession
 
 logger = logging.getLogger(__name__)
 
-# 下载方向分片大小（SDS §7.1 建议 1MB）
-DOWNLOAD_CHUNK_SIZE = 1 * 1024 * 1024
+# 下载方向分片大小（8MB）
+DOWNLOAD_CHUNK_SIZE = 8 * 1024 * 1024
 # 等待单片 CHUNK_ACK 超时（秒）
 CHUNK_ACK_TIMEOUT = 30.0
 # 等待 TASK_CONFIRM 超时（秒）
 TASK_CONFIRM_TIMEOUT = 30.0
+
+
+def _protocol_log(event: str, current: str, next_step: str, **fields: object) -> None:
+    """Structured protocol logs for tracking step progression and next action."""
+    extra = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
+    logger.info("[protocol][%s] current=%s next=%s %s", event, current, next_step, extra)
 
 
 class DispatchService:
@@ -140,6 +146,13 @@ class DispatchService:
 
     async def dispatch_task(self, task_id: int, node_id: str) -> None:
         """将任务下发到指定节点（coroutine，通过 schedule_coroutine 从 Tkinter 调用）。"""
+        _protocol_log(
+            "dispatch_start",
+            "GUI requested dispatch",
+            "validate task status and node availability",
+            task_id=task_id,
+            node_id=node_id,
+        )
         # 1. 验证任务状态
         task = self._task_repo.get_task(task_id)
         if task.status != "review_done":
@@ -201,6 +214,15 @@ class DispatchService:
             f"任务 {task_id} 下发至节点 {node_id}，transfer_id={transfer_id}",
             record.id,
         )
+        _protocol_log(
+            "dispatch_prepared",
+            "dispatch record persisted",
+            "send TASK_ASSIGN then wait TASK_CONFIRM",
+            task_id=task_id,
+            node_id=node_id,
+            transfer_id=transfer_id,
+            total_chunks=total_chunks,
+        )
 
         # 7. 发送 TASK_ASSIGN（先注册 confirm_event 再发送，防竞态）
         task_id_str = str(task_id)
@@ -230,6 +252,14 @@ class DispatchService:
         try:
             await session.send_control(assign_msg.to_dict())
             logger.info("TASK_ASSIGN 已发送: task=%d node=%s", task_id, node_id)
+            _protocol_log(
+                "task_assign_sent",
+                "TASK_ASSIGN sent",
+                "wait TASK_CONFIRM from node",
+                task_id=task_id,
+                node_id=node_id,
+                confirm_timeout_sec=TASK_CONFIRM_TIMEOUT,
+            )
 
             # 8. 等待 TASK_CONFIRM
             try:
@@ -240,6 +270,13 @@ class DispatchService:
                 )
                 self._dispatch_repo.append_audit_log(
                     node_id, "CONFIRM_TIMEOUT", "等待 TASK_CONFIRM 超时 (30s)", record.id
+                )
+                _protocol_log(
+                    "task_confirm_timeout",
+                    "wait TASK_CONFIRM timeout",
+                    "node should reconnect and server can re-dispatch",
+                    task_id=task_id,
+                    node_id=node_id,
                 )
                 return
 
@@ -252,11 +289,27 @@ class DispatchService:
                 self._dispatch_repo.append_audit_log(
                     node_id, "TASK_REJECTED", f"节点拒绝: {reason}", record.id
                 )
+                _protocol_log(
+                    "task_rejected",
+                    "TASK_CONFIRM accepted=false",
+                    "wait manual retry or dispatch to another node",
+                    task_id=task_id,
+                    node_id=node_id,
+                    reason=reason,
+                )
                 return
 
             # 9. 节点接受 → 开始传输
             self._dispatch_repo.update_dispatch_status(record.id, "confirmed")
             logger.info("节点确认接受任务: task=%d node=%s", task_id, node_id)
+            _protocol_log(
+                "task_confirmed",
+                "TASK_CONFIRM accepted=true",
+                "start file chunk transfer on data channel",
+                task_id=task_id,
+                node_id=node_id,
+                transfer_id=transfer_id,
+            )
             await self._do_download_transfer(session, record, xfer, video_path)
 
         finally:
@@ -269,6 +322,13 @@ class DispatchService:
         node_id = session.node_id
         if node_id is None:
             return
+        _protocol_log(
+            "hello_handle_start",
+            "session ready callback entered",
+            "persist node and send HELLO_ACK",
+            node_id=node_id,
+            peer_ip=session.peer_ip,
+        )
 
         # 注册/更新节点
         self._dispatch_repo.upsert_node(
@@ -302,6 +362,13 @@ class DispatchService:
             logger.info(
                 "HELLO_ACK 已发送: node=%s sync_actions=%d", node_id, len(sync_actions)
             )
+            _protocol_log(
+                "hello_ack_sent",
+                "HELLO_ACK sent",
+                "wait TASK_ASSIGN or status reporting",
+                node_id=node_id,
+                sync_actions=len(sync_actions),
+            )
         except Exception as exc:
             logger.exception("发送 HELLO_ACK 失败: %s", exc)
 
@@ -312,6 +379,14 @@ class DispatchService:
     ) -> None:
         task_id_str = msg.taskId
         self._confirm_msgs[task_id_str] = msg
+        _protocol_log(
+            "task_confirm_received",
+            "TASK_CONFIRM received",
+            "wake dispatch coroutine and continue transfer/abort",
+            node_id=session.node_id,
+            task_id=task_id_str,
+            accepted=msg.accepted,
+        )
         evt = self._confirm_events.get(task_id_str)
         if evt:
             evt.set()
@@ -366,6 +441,15 @@ class DispatchService:
         task_id_str = str(record.task_id)
         transfer_id = xfer.transfer_id
         loop = asyncio.get_running_loop()
+        _protocol_log(
+            "download_start",
+            "dispatch confirmed",
+            "send CHUNK frames and await CHUNK_ACK",
+            task_id=record.task_id,
+            node_id=session.node_id,
+            transfer_id=transfer_id,
+            total_chunks=xfer.total_chunks,
+        )
 
         try:
             with open(video_path, "rb") as f:
@@ -422,6 +506,14 @@ class DispatchService:
                 "下载传输完成: task=%d chunks=%d hash=%s...",
                 record.task_id, xfer.total_chunks, xfer.file_hash[:8],
             )
+            _protocol_log(
+                "download_complete",
+                "TRANSFER_COMPLETE sent",
+                "wait node processing then result upload",
+                task_id=record.task_id,
+                node_id=session.node_id,
+                transfer_id=transfer_id,
+            )
             self._dispatch_repo.append_audit_log(
                 session.node_id or "",
                 "DOWNLOAD_COMPLETE",
@@ -442,6 +534,14 @@ class DispatchService:
         self, session: NodeSession, msg: MsgTransferResumeRequest
     ) -> None:
         """收到节点 TRANSFER_RESUME_REQUEST，仅补发缺失分片。"""
+        _protocol_log(
+            "resume_request_received",
+            "TRANSFER_RESUME_REQUEST received",
+            "calculate missing chunks and retransmit",
+            node_id=session.node_id,
+            transfer_id=msg.transferId,
+            missing_count=len(msg.missingIndices),
+        )
         xfer = self._dispatch_repo.get_transfer_session_by_transfer_id(msg.transferId)
         if xfer is None:
             logger.warning("续传请求：找不到 transfer_id=%s", msg.transferId)
@@ -521,6 +621,14 @@ class DispatchService:
             self._dispatch_repo.complete_transfer_session(xfer.id)
             self._dispatch_repo.update_dispatch_status(record.id, "running")
             logger.info("续传完成: task=%d", record.task_id)
+            _protocol_log(
+                "resume_complete",
+                "missing chunks retransmitted",
+                "wait node processing then result upload",
+                task_id=record.task_id,
+                node_id=session.node_id,
+                transfer_id=transfer_id,
+            )
 
         except Exception as exc:
             logger.exception("续传失败: %s", exc)
@@ -561,6 +669,16 @@ class DispatchService:
                     chunkIndex=msg.chunkIndex,
                 ).to_dict()
             )
+            if msg.chunkIndex == 0:
+                _protocol_log(
+                    "result_upload_started",
+                    "first result chunk acknowledged",
+                    "continue receiving RESULT_CHUNK until RESULT_TRANSFER_COMPLETE",
+                    task_id=msg.taskId,
+                    node_id=session.node_id,
+                    transfer_id=msg.transferId,
+                    file_role=msg.fileRole,
+                )
         except Exception as exc:
             logger.exception("发送结果 CHUNK_ACK 失败: %s", exc)
 
@@ -570,6 +688,14 @@ class DispatchService:
         self, session: NodeSession, msg: MsgResultTransferComplete
     ) -> None:
         """触发结果文件组装与验收。"""
+        _protocol_log(
+            "result_transfer_complete_received",
+            "RESULT_TRANSFER_COMPLETE received",
+            "ingest files, verify hash, update dispatch status",
+            task_id=msg.taskId,
+            node_id=session.node_id,
+            transfer_id=msg.transferId,
+        )
         try:
             task_id = int(msg.taskId)
         except ValueError:
@@ -606,6 +732,13 @@ class DispatchService:
             session.active_dispatch_id = None
             session.status = "online"
             logger.info("结果验收通过: task=%d node=%s", task_id, node_id)
+            _protocol_log(
+                "result_accepted",
+                "result ingest completed",
+                "node returns to online idle and waits next TASK_ASSIGN",
+                task_id=task_id,
+                node_id=node_id,
+            )
             self._dispatch_repo.append_audit_log(
                 node_id,
                 "RESULT_ACCEPTED",
