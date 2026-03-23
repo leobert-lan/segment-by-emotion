@@ -2,13 +2,12 @@ package osp.leobert.androd.mediaservice.service
 
 import android.annotation.SuppressLint
 import android.util.Log
+import com.google.gson.Gson
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
-import kotlinx.serialization.encodeToString
-import kotlinx.serialization.json.Json
 import osp.leobert.androd.mediaservice.domain.model.NodeTask
 import osp.leobert.androd.mediaservice.domain.model.ProcessingParams
 import osp.leobert.androd.mediaservice.domain.model.VideoMeta
@@ -43,6 +42,8 @@ class TaskOrchestrator(
     companion object {
         private const val TAG = "TaskOrchestrator"
     }
+
+    private val gson = Gson()
 
     private val _taskState = MutableStateFlow<TaskState>(TaskState.Idle)
     val taskState: StateFlow<TaskState> = _taskState
@@ -119,7 +120,7 @@ class TaskOrchestrator(
                     fileSizeBytes = meta.fileSizeBytes,
                     totalChunks = meta.totalChunks,
                     fileHash = meta.fileHash,
-                    processingParamsJson = Json.encodeToString(msg.processingParams),
+                    processingParamsJson = gson.toJson(msg.processingParams),
                     status = "Receiving",
                     createdAt = now,
                     updatedAt = now,

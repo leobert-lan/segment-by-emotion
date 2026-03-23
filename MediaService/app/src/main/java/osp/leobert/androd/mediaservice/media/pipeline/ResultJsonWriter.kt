@@ -1,65 +1,58 @@
 package osp.leobert.androd.mediaservice.media.pipeline
 
 import android.util.Log
-import kotlinx.serialization.SerialName
-import kotlinx.serialization.Serializable
-import kotlinx.serialization.encodeToString
-import kotlinx.serialization.json.Json
+import com.google.gson.GsonBuilder
+import com.google.gson.annotations.SerializedName
 import osp.leobert.androd.mediaservice.domain.model.ProcessingParams
 import osp.leobert.androd.mediaservice.domain.model.VideoSegment
 import java.io.File
 
 // ── Wire-format data classes (schema_version = "v1") ─────────────────────────
 
-@Serializable
 private data class ResultJson(
-    val schema_version: String = "v1",
-    val task: TaskInfo,
-    val summary: Summary,
-    val processed_segments: List<SegmentInfo>,
-    val output: OutputInfo,
-    val processed_at_ms: Long,
+    @SerializedName("schema_version") val schemaVersion: String = "v1",
+    @SerializedName("task") val task: TaskInfo,
+    @SerializedName("summary") val summary: Summary,
+    @SerializedName("processed_segments") val processedSegments: List<SegmentInfo>,
+    @SerializedName("output") val output: OutputInfo,
+    @SerializedName("processed_at_ms") val processedAtMs: Long,
 )
 
-@Serializable
 private data class TaskInfo(
-    val id: String,
-    val video_name: String,
-    val status: String = "done",
+    @SerializedName("id") val id: String,
+    @SerializedName("video_name") val videoName: String,
+    @SerializedName("status") val status: String = "done",
 )
 
-@Serializable
 private data class Summary(
     /** Total number of segments received from the Python server. */
-    val total_segments_received: Int,
-    val interesting_count: Int,
-    val uninteresting_count: Int,
-    val unlabeled_count: Int,
+    @SerializedName("total_segments_received") val totalSegmentsReceived: Int,
+    @SerializedName("interesting_count") val interestingCount: Int,
+    @SerializedName("uninteresting_count") val uninterestingCount: Int,
+    @SerializedName("unlabeled_count") val unlabeledCount: Int,
     /** Segments that were actually transcoded (= interesting_count). */
-    val processed_count: Int,
+    @SerializedName("processed_count") val processedCount: Int,
 )
 
-@Serializable
 private data class SegmentInfo(
-    val start_ms: Long,
-    val end_ms: Long,
-    @SerialName("start_sec") val startSec: Double,
-    @SerialName("end_sec") val endSec: Double,
-    val label: String,
+    @SerializedName("start_ms") val startMs: Long,
+    @SerializedName("end_ms") val endMs: Long,
+    @SerializedName("start_sec") val startSec: Double,
+    @SerializedName("end_sec") val endSec: Double,
+    @SerializedName("label") val label: String,
 )
 
-@Serializable
 private data class OutputInfo(
-    val file_name: String,
-    val file_size_bytes: Long,
-    val target_height_px: Int,
-    val target_bitrate_kbps: Int,
-    val mime_type: String,
+    @SerializedName("file_name") val fileName: String,
+    @SerializedName("file_size_bytes") val fileSizeBytes: Long,
+    @SerializedName("target_height_px") val targetHeightPx: Int,
+    @SerializedName("target_bitrate_kbps") val targetBitrateKbps: Int,
+    @SerializedName("mime_type") val mimeType: String,
 )
 
 // ── Writer ────────────────────────────────────────────────────────────────────
 
-private val jsonEncoder = Json { prettyPrint = true; encodeDefaults = true }
+private val jsonEncoder = GsonBuilder().setPrettyPrinting().create()
 
 private const val TAG = "ResultJsonWriter"
 
@@ -71,10 +64,10 @@ private const val TAG = "ResultJsonWriter"
  * - `label_events` is omitted (those are Python-side data).
  *
  * @param taskId           Task identifier.
- * @param videoName        Original video file name from [VideoMeta].
+ * @param videoName        Original video file name from task video metadata.
  * @param params           Full [ProcessingParams] (all segments, including skipped ones).
- * @param targetHeightPx   Output resolution height from [ResolutionPolicy].
- * @param targetBitrateKbps Output bitrate from [BitratePolicy].
+ * @param targetHeightPx   Output resolution height chosen by pipeline policy.
+ * @param targetBitrateKbps Output bitrate chosen by pipeline policy.
  * @param mimeType         Output video MIME type (e.g. "video/hevc").
  * @param resultVideoFile  The transcoded output file (used to read file size).
  * @param outputFile       Destination `result.json` file path.
@@ -94,35 +87,35 @@ fun writeResultJson(
     val unlabeled    = params.segments.filter { it.label == VideoSegment.LABEL_UNLABELED }
 
     val result = ResultJson(
-        task = TaskInfo(id = taskId, video_name = videoName),
+        task = TaskInfo(id = taskId, videoName = videoName),
         summary = Summary(
-            total_segments_received = params.segments.size,
-            interesting_count  = interesting.size,
-            uninteresting_count = uninteresting.size,
-            unlabeled_count    = unlabeled.size,
-            processed_count    = interesting.size,
+            totalSegmentsReceived = params.segments.size,
+            interestingCount  = interesting.size,
+            uninterestingCount = uninteresting.size,
+            unlabeledCount    = unlabeled.size,
+            processedCount    = interesting.size,
         ),
-        processed_segments = interesting.map { seg ->
+        processedSegments = interesting.map { seg ->
             SegmentInfo(
-                start_ms = seg.startMs,
-                end_ms   = seg.endMs,
+                startMs = seg.startMs,
+                endMs   = seg.endMs,
                 startSec = seg.startMs / 1000.0,
                 endSec   = seg.endMs   / 1000.0,
                 label    = seg.label,
             )
         },
         output = OutputInfo(
-            file_name          = resultVideoFile.name,
-            file_size_bytes    = resultVideoFile.length(),
-            target_height_px   = targetHeightPx,
-            target_bitrate_kbps = targetBitrateKbps,
-            mime_type          = mimeType,
+            fileName          = resultVideoFile.name,
+            fileSizeBytes    = resultVideoFile.length(),
+            targetHeightPx   = targetHeightPx,
+            targetBitrateKbps = targetBitrateKbps,
+            mimeType          = mimeType,
         ),
-        processed_at_ms = System.currentTimeMillis(),
+        processedAtMs = System.currentTimeMillis(),
     )
 
     runCatching {
-        outputFile.writeText(jsonEncoder.encodeToString(result))
+        outputFile.writeText(jsonEncoder.toJson(result))
         Log.i(TAG, "[$taskId] result.json written → ${outputFile.name} (${outputFile.length()}B)")
     }.onFailure { e ->
         Log.e(TAG, "[$taskId] Failed to write result.json", e)

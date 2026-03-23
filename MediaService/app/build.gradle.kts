@@ -1,7 +1,6 @@
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
-    alias(libs.plugins.kotlin.serialization)
     alias(libs.plugins.ksp)
 }
 
@@ -46,8 +45,8 @@ dependencies {
 
     // Coroutines
     implementation(libs.kotlinx.coroutines.android)
-    // JSON serialization (protocol messages)
-    implementation(libs.kotlinx.serialization.json)
+    // JSON serialization
+    implementation(libs.gson)
     // Room (local task + chunk state persistence for resume support)
     implementation(libs.androidx.room.runtime)
     implementation(libs.androidx.room.ktx)

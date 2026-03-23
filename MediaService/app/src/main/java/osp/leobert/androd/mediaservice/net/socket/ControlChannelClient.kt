@@ -1,5 +1,6 @@
 package osp.leobert.androd.mediaservice.net.socket
 
+import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -23,13 +24,17 @@ import java.net.Socket
  * - Connects on [connect]; sends HELLO immediately.
  * - Runs a read loop that publishes parsed [ControlMessage]s to [incomingMessages].
  * - Thread-safe write via [send] (Mutex-protected).
- * - Heartbeat: caller is responsible for periodic [TaskStatusReport] sends.
+ * - Heartbeat: caller is responsible for periodic [ControlMessage.TaskStatusReport] sends.
  */
 class ControlChannelClient(
     private val host: String,
     private val port: Int,
     private val helloBuilder: () -> ControlMessage.Hello,
 ) {
+
+    companion object {
+        private const val TAG = "ControlChannelClient"
+    }
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
@@ -39,6 +44,7 @@ class ControlChannelClient(
     private var socket: Socket? = null
     private val writeMutex = Mutex()
     private var readJob: Job? = null
+    private val connId: String = Integer.toHexString(System.identityHashCode(this))
 
     val isConnected: Boolean get() = socket?.isConnected == true && socket?.isClosed == false
 
@@ -48,10 +54,18 @@ class ControlChannelClient(
      * @throws Exception if connection fails.
      */
     suspend fun connect() = withContext(Dispatchers.IO) {
+        Log.i(TAG, "[$connId] connect start host=$host port=$port")
         val s = Socket(host, port)
         socket = s
+        Log.i(
+            TAG,
+            "[$connId] connect success local=${s.localAddress.hostAddress}:${s.localPort} " +
+                "remote=${s.inetAddress.hostAddress}:${s.port}",
+        )
         readJob = scope.launch { readLoop(s) }
-        send(helloBuilder())
+        val hello = helloBuilder()
+        Log.d(TAG, "[$connId] send HELLO requestId=${hello.requestId}")
+        send(hello)
     }
 
     /**
@@ -61,28 +75,48 @@ class ControlChannelClient(
         writeMutex.withLock {
             val sock = socket ?: error("Control channel not connected")
             val encoded = MessageFramer.encodeControl(message)
-            sock.getOutputStream().write(encoded.toByteArray(Charsets.UTF_8))
+            val bytes = encoded.toByteArray(Charsets.UTF_8)
+            Log.d(
+                TAG,
+                "[$connId] send type=${message.type} requestId=${message.requestId} bytes=${bytes.size}",
+            )
+            sock.getOutputStream().write(bytes)
             sock.getOutputStream().flush()
         }
     }
 
     suspend fun disconnect() {
+        Log.i(TAG, "[$connId] disconnect start isConnected=$isConnected")
         readJob?.cancelAndJoin()
         withContext(Dispatchers.IO) { socket?.close() }
         socket = null
+        Log.i(TAG, "[$connId] disconnect done")
     }
 
     private suspend fun readLoop(s: Socket) {
         val reader = BufferedReader(InputStreamReader(s.getInputStream(), Charsets.UTF_8))
+        Log.d(TAG, "[$connId] readLoop start")
         try {
             var line: String?
             while (reader.readLine().also { line = it } != null) {
-                val msg = runCatching { MessageFramer.decodeControl(line!!) }.getOrNull() ?: continue
+                val raw = line!!
+                val msg = runCatching { MessageFramer.decodeControl(raw) }
+                    .onFailure {
+                        Log.w(TAG, "[$connId] decode failed rawLength=${raw.length} error=${it.message}")
+                    }
+                    .getOrNull() ?: continue
+                Log.d(
+                    TAG,
+                    "[$connId] recv type=${msg.type} requestId=${msg.requestId} rawLength=${raw.length}",
+                )
                 _incomingMessages.emit(msg)
             }
-        } catch (_: Exception) {
+            Log.i(TAG, "[$connId] readLoop end: peer closed stream")
+        } catch (e: Exception) {
             // Socket closed or IO error — connection manager handles reconnect.
+            Log.w(TAG, "[$connId] readLoop exception error=${e.message}", e)
+        } finally {
+            Log.d(TAG, "[$connId] readLoop exit")
         }
     }
 }
-
