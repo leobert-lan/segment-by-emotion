@@ -2,6 +2,19 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- Network: TCP socket connections to Python server -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Keep CPU on during background processing -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- ForegroundService base permission -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Required on API 34+ for dataSync foreground service type -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- Write processed video output to shared storage (API 29-: WRITE_EXTERNAL_STORAGE) -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+
     <application
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
@@ -11,6 +24,7 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.MediaService">
+
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -18,10 +32,21 @@
             android:theme="@style/Theme.MediaService">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
-
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+            MediaNodeService: ForegroundService for video receive / process / upload.
+            foregroundServiceType="dataSync" is required on API 34+ (Android 14+).
+            ACTION_CONNECT / ACTION_DISCONNECT are sent from the UI.
+        -->
+        <service
+            android:name=".service.MediaNodeService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
     </application>
 
 </manifest>
+
