@@ -56,6 +56,7 @@ class TaskOrchestrator(
             if (pending != null) {
                 Log.i(TAG, "Resuming incomplete task: ${pending.taskId}")
             }
+            //todo 这里查询了未完成的任务，但没有做任何处理，如果要处理，是否应该阻塞连接呢？？
 
             val host = prefs.serverHost.first()
             val controlPort = prefs.controlPort.first()
