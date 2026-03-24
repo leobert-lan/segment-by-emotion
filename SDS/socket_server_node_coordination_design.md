@@ -33,6 +33,14 @@
 - 通道配对超时：30s（控制等数据；数据等控制）
 - HELLO 等待超时：30s
 
+## 3.1 实现对齐约束（联调必须遵守）
+
+1. `HELLO_ACK` 收到后，Android 不得继续停留 `TaskState.Connecting`。
+2. `TASK_STATUS_REPORT.status` 表达的是“任务状态”，不是“连接状态”。
+3. `TASK_STATUS_QUERY(taskId)` 必须按 `taskId` 返回状态快照（优先本地持久化任务），不要回全局连接态。
+4. Python `DispatchService` 仅识别任务态：`AwaitingTask/Receiving/Processing/Uploading/Done/Error`。
+5. 若上报 `Connecting`，服务端状态机会忽略该消息（不会推进 dispatch_status）。
+
 ## 4. 节点接入与握手（细粒度）
 
 ### 4.1 流程图
@@ -156,6 +164,18 @@ sequenceDiagram
 ```
 
 ## 8. 排障建议清单
+
+### 8.0 连接卡在“连接中”但已收到 HELLO_ACK
+
+- 判据：
+  - Android 有 `recv HELLO_ACK`；
+  - 仍持续上报 `TASK_STATUS_REPORT status=Connecting`。
+- 定位：
+  - Android `TaskOrchestrator.handleHelloAck()` 未迁出 `Connecting`；
+  - Android `handleStatusQuery()` 返回了连接态而非任务态。
+- 处理：
+  - `HELLO_ACK` 后迁移到 `AwaitingTask`（或恢复态）；
+  - `TASK_STATUS_QUERY` 返回 task-scope 快照。
 
 1. 先看服务端是否出现 `[protocol][pair_ready]` 与 `[protocol][data_loop_start]`。
 2. 再看 `TASK_ASSIGN -> TASK_CONFIRM -> CHUNK/CHUNK_ACK` 是否完整。

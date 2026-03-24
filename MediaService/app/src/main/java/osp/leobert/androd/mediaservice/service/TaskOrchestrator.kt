@@ -50,6 +50,13 @@ class TaskOrchestrator(
 
     private var currentTask: NodeTask? = null
 
+    private data class StatusSnapshot(
+        val status: String,
+        val progress: Float,
+        val stage: String?,
+        val lastError: String?,
+    )
+
     suspend fun run() {
         try {
             val pending = withContext(Dispatchers.IO) { db.taskDao().getPendingTask() }
@@ -94,7 +101,10 @@ class TaskOrchestrator(
                 else -> Log.w(TAG, "Unknown sync_action: ${action.action}")
             }
         }
-        if (ack.syncActions.isEmpty()) _taskState.value = TaskState.AwaitingTask
+        // HELLO_ACK 代表控制面已握手完成；是否有 sync action 不应阻塞退出 Connecting。
+        if (_taskState.value is TaskState.Connecting) {
+            _taskState.value = TaskState.AwaitingTask
+        }
     }
 
     @SuppressLint("NewApi") // minSdk=31 > API 26 required by Instant.now()
@@ -272,20 +282,54 @@ class TaskOrchestrator(
     }
 
     private suspend fun handleStatusQuery(msg: ControlMessage.TaskStatusQuery) {
-        val state = _taskState.value
+        val snapshot = buildStatusSnapshot(msg.taskId)
         val report = ControlMessage.TaskStatusReport(
             requestId = java.util.UUID.randomUUID().toString(),
             taskId = msg.taskId,
-            status = state::class.simpleName ?: "Unknown",
-            progress = when (state) {
-                is TaskState.Receiving  -> state.progress
-                is TaskState.Processing -> state.progress
-                is TaskState.Uploading  -> state.progress
-                else -> 0f
-            },
-            stage = (state as? TaskState.Processing)?.stage?.name,
+            status = snapshot.status,
+            progress = snapshot.progress,
+            stage = snapshot.stage,
+            lastError = snapshot.lastError,
         )
         connectionManager.controlChannel?.send(report)
+    }
+
+    private suspend fun buildStatusSnapshot(taskId: String): StatusSnapshot {
+        val state = _taskState.value
+        when (state) {
+            is TaskState.Receiving -> if (state.taskId == taskId) {
+                return StatusSnapshot("Receiving", state.progress, null, null)
+            }
+            is TaskState.Processing -> if (state.taskId == taskId) {
+                return StatusSnapshot("Processing", state.progress, state.stage.name, null)
+            }
+            is TaskState.Uploading -> if (state.taskId == taskId) {
+                return StatusSnapshot("Uploading", state.progress, null, null)
+            }
+            is TaskState.Done -> if (state.taskId == taskId) {
+                return StatusSnapshot("Done", 1f, null, null)
+            }
+            is TaskState.Error -> if (state.taskId == taskId) {
+                return StatusSnapshot("Error", 0f, null, state.reason)
+            }
+            else -> Unit
+        }
+
+        val persisted = withContext(Dispatchers.IO) { db.taskDao().getById(taskId) }
+        if (persisted != null) {
+            val normalized = when (persisted.status) {
+                "Idle", "Connecting" -> "AwaitingTask"
+                else -> persisted.status
+            }
+            return StatusSnapshot(
+                status = normalized,
+                progress = 0f,
+                stage = null,
+                lastError = persisted.errorMessage,
+            )
+        }
+
+        return StatusSnapshot("AwaitingTask", 0f, null, null)
     }
 
     private suspend fun reportProgress(taskId: String) = handleStatusQuery(

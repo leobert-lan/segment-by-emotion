@@ -410,6 +410,8 @@ class DispatchService:
 
         # Android TaskState 名称 → dispatch_status 映射
         STATUS_MAP: dict[str, str] = {
+            # 兼容旧客户端：连接已建立但仍上报 Connecting 时，按 confirmed 处理。
+            "Connecting": "confirmed",
             "Receiving": "transferring",
             "AwaitingTask": "confirmed",
             "Processing": "running",

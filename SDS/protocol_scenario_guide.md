@@ -67,6 +67,25 @@
 - 生命周期编排：`MediaService/.../TaskOrchestrator.kt`
 - 结果上传：`MediaService/.../UploadManager.kt`
 
+### 2.3 状态口径对齐（必须一致）
+
+> 这是当前联调最容易错位的部分。`TASK_STATUS_REPORT.status` 必须是“任务状态”，不是“连接状态”。
+
+| 场景 | Android 必须发送 | Python 映射到 dispatch_status |
+|---|---|---|
+| 刚连上，等待任务 | `AwaitingTask` | `confirmed` |
+| 接收下发分片 | `Receiving` | `transferring` |
+| 本地处理中 | `Processing` | `running` |
+| 上传结果中 | `Uploading` | `uploading` |
+| 完成 | `Done` | `done` |
+| 失败 | `Error` | `failed` |
+
+约束：
+
+- Android 在收到 `HELLO_ACK` 后，必须退出 `Connecting`（进入 `AwaitingTask` 或恢复态）。
+- Android 响应 `TASK_STATUS_QUERY(taskId)` 时，优先返回该 `taskId` 的本地任务快照（Room），不要直接回全局 `TaskState.Connecting`。
+- Python 仅将上述任务态映射到 `dispatch_status`；未识别状态会被忽略，不会推进分发状态机。
+
 ## 3. 场景 A：节点上线握手（双通道 + HELLO）
 
 ### 3.1 目标
@@ -132,6 +151,17 @@ Server -> Node `HELLO_ACK`：
 
 - 配对等待：30s
 - 等待 HELLO：30s
+
+### 3.6 联调判定点（连接成功的最小闭环）
+
+按顺序看到以下日志，才算“连接完成”：
+
+1. Server: `[protocol][hello_received]`
+2. Server: `[protocol][hello_ack_sent]`
+3. Android: `recv type=HELLO_ACK`
+4. Android: 状态迁移到 `AwaitingTask`（或恢复态），而不是长期停在 `Connecting`
+
+若第 3 步存在但第 4 步不存在，优先检查 Android 状态机实现而不是网络连通性。
 
 ## 4. 场景 B：任务下发与确认（TASK_ASSIGN / TASK_CONFIRM）
 
@@ -438,6 +468,14 @@ Node -> Server `TRANSFER_RESUME_REQUEST`（下载方向）：
 ```
 
 ## 9. 排障速查（按症状）
+
+### 9.0 症状：HELLO_ACK 已收到，但客户端一直“连接中”
+
+- 现象：Android 日志有 `recv HELLO_ACK`，但后续 `TASK_STATUS_REPORT.status=Connecting`。
+- 结论：控制面握手成功，但状态机口径错位（把连接态上报为任务态）。
+- 修复准则：
+  - `HELLO_ACK` 后将状态从 `Connecting` 迁出；
+  - `TASK_STATUS_QUERY` 返回任务快照状态（`AwaitingTask/Receiving/Processing/Uploading/...`），不要返回 `Connecting`。
 
 ### 9.1 症状：上传等待 ACK 超时
 
