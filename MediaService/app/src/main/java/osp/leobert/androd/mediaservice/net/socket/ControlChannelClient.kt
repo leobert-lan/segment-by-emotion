@@ -78,7 +78,7 @@ class ControlChannelClient(
             val bytes = encoded.toByteArray(Charsets.UTF_8)
             Log.d(
                 TAG,
-                "[$connId] send type=${message.type} requestId=${message.requestId} bytes=${bytes.size}",
+                "[$connId] send type=${message.type} requestId=${message.requestId} bytes=${bytes.size}\r\n content=$encoded",
             )
             sock.getOutputStream().write(bytes)
             sock.getOutputStream().flush()

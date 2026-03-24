@@ -21,7 +21,7 @@ import threading
 from typing import Any, Callable, Optional
 
 from src.net.socket.node_session import NodeSession
-from src.net.protocol.control_message import decode_control
+from src.net.protocol.control_message import MsgHello, decode_control
 from src.net.protocol.message_framer import read_data_frame
 
 logger = logging.getLogger(__name__)
@@ -105,7 +105,7 @@ class SocketServer:
 
     def stop(self) -> None:
         if self._loop and self._stop_event:
-            self._loop.call_soon_threadsafe(self._stop_event.set)
+            asyncio.run_coroutine_threadsafe(self._signal_stop(), self._loop)
         if self._thread:
             self._thread.join(timeout=5)
 
@@ -155,6 +155,10 @@ class SocketServer:
             await self._stop_event.wait()  # type: ignore[union-attr]
         logger.info("SocketServer 已停止")
 
+    async def _signal_stop(self) -> None:
+        if self._stop_event is not None:
+            self._stop_event.set()
+
     # ── 控制通道处理 ──────────────────────────────────────────────────────────
 
     async def _handle_control(
@@ -184,24 +188,18 @@ class SocketServer:
             _protocol_log(
                 "pair_ready_data_first",
                 "control paired with pending data channel",
-                "start data loop task then wait HELLO",
+                "wait HELLO then start data loop",
                 peer_ip=peer_ip,
             )
-            # data-first 场景下 _handle_data 已返回，需要在此处启动数据循环
-            asyncio.create_task(
-                self._run_data_after_hello(session, dr, peer_ip, source="control_side")
-            )
-            # data 先到达时，需在这里启动数据读取循环。
             asyncio.create_task(self._run_data_when_ready(session, dr))
         else:
             _protocol_log(
-                "pair_ready_ctrl_first",
-                "data paired with pending control channel",
-                "wait HELLO then enter data loop",
+                "control_pending",
+                "control channel accepted",
+                "wait data channel pairing",
                 peer_ip=peer_ip,
             )
             self._pending_ctrl[peer_ip] = session
-            # 等待数据通道配对
             evt = asyncio.Event()
             self._pair_events[peer_ip] = evt
             _protocol_log(
@@ -210,13 +208,26 @@ class SocketServer:
                 "data channel should connect within pair timeout",
                 peer_ip=peer_ip,
                 pair_timeout_sec=_PAIR_TIMEOUT,
-            evt = asyncio.Event()
-            self._pending_data_events[peer_ip] = evt
-            asyncio.create_task(self._expire_pending_data(peer_ip, evt))
             )
-            ok = await self._wait_pair(peer_ip, evt)
+            ok = await self._wait_pair(evt)
             self._pair_events.pop(peer_ip, None)
-        await self._run_data_after_hello(session, reader, peer_ip, source="data_side")
+
+            if not ok:
+                self._pending_ctrl.pop(peer_ip, None)
+                logger.warning("等待数据通道配对超时: %s", peer_ip)
+                _protocol_log(
+                    "pair_timeout",
+                    "control pending timed out",
+                    "client reconnect both channels",
+                    peer_ip=peer_ip,
+                    pair_timeout_sec=_PAIR_TIMEOUT,
+                )
+                session.close()
+                return
+
+        try:
+            raw = await asyncio.wait_for(reader.readline(), timeout=_HELLO_TIMEOUT)
+        except asyncio.TimeoutError:
             logger.warning("等待 HELLO 超时: %s", peer_ip)
             _protocol_log(
                 "hello_timeout",
@@ -239,7 +250,6 @@ class SocketServer:
             session.close()
             return
 
-        from src.net.protocol.control_message import MsgHello
         if not isinstance(msg, MsgHello):
             logger.warning("期望 HELLO，收到 %s from %s", type(msg).__name__, peer_ip)
             session.close()
@@ -334,6 +344,9 @@ class SocketServer:
         else:
             # 控制通道还没来，暂存
             self._pending_data[peer_ip] = (reader, writer)
+            evt = asyncio.Event()
+            self._pending_data_events[peer_ip] = evt
+            asyncio.create_task(self._expire_pending_data(peer_ip, evt))
             logger.debug("数据通道暂存等待 ctrl: %s", peer_ip)
             _protocol_log(
                 "data_pending",
@@ -430,46 +443,13 @@ class SocketServer:
 
     # ── 工具 ──────────────────────────────────────────────────────────────────
 
-    async def _wait_pair(self, peer_ip: str, evt: asyncio.Event) -> bool:
+    async def _wait_pair(self, evt: asyncio.Event) -> bool:
         try:
             await asyncio.wait_for(evt.wait(), timeout=_PAIR_TIMEOUT)
             return True
         except asyncio.TimeoutError:
             return False
 
-    async def _run_data_after_hello(
-        self,
-        session: NodeSession,
-        reader: asyncio.StreamReader,
-        peer_ip: str,
-        source: str,
-    ) -> None:
-        # 等待 session 就绪（node_id 由 HELLO 设置）
-        for _ in range(60):  # 最多等 6 秒
-            if session.node_id is not None:
-                break
-            await asyncio.sleep(0.1)
-
-        if session.node_id is None:
-            logger.warning("数据通道等待 HELLO 超时: %s", peer_ip)
-            _protocol_log(
-                "data_wait_hello_timeout",
-                "data paired but node_id unresolved",
-                "control channel should send HELLO",
-                peer_ip=peer_ip,
-                source=source,
-            )
-            return
-
-        _protocol_log(
-            "data_loop_start",
-            "data channel ready",
-            "receive CHUNK/RESULT frames",
-            node_id=session.node_id,
-            peer_ip=peer_ip,
-            source=source,
-        )
-        await self._data_loop(session, reader)
 
     async def _expire_pending_data(self, peer_ip: str, evt: asyncio.Event) -> None:
         """清理 data-first 但长期未配对的连接，避免悬挂连接污染重连。"""
