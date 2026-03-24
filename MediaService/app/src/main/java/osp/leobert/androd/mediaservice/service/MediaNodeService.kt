@@ -3,9 +3,7 @@ package osp.leobert.androd.mediaservice.service
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
-import android.content.Context
 import android.content.Intent
-import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
@@ -24,6 +22,7 @@ import osp.leobert.androd.mediaservice.storage.db.AppDatabase
 import osp.leobert.androd.mediaservice.storage.file.FileStoreManager
 import osp.leobert.androd.mediaservice.storage.prefs.NodePreferences
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * ForegroundService that hosts the [TaskOrchestrator].
@@ -54,7 +53,7 @@ class MediaNodeService : LifecycleService() {
 
     override fun onCreate() {
         super.onCreate()
-        notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         createNotificationChannel()
     }
 
@@ -82,6 +81,7 @@ class MediaNodeService : LifecycleService() {
         val prefs = NodePreferences(applicationContext)
         val db = AppDatabase.getInstance(applicationContext)
         val fileStore = FileStoreManager(applicationContext)
+        val helloCurrentTask = AtomicReference<ControlMessage.CurrentTaskSnapshot?>(null)
 
         val connectionManager = SocketConnectionManager(
             host = host,
@@ -97,6 +97,7 @@ class MediaNodeService : LifecycleService() {
                             gpu = true,
                             codec = listOf("hevc", "avc"),
                         ),
+                        currentTask = helloCurrentTask.get(),
                     )
                 }
             },
@@ -115,7 +116,14 @@ class MediaNodeService : LifecycleService() {
         )
 
         val pipeline = MediaPipeline(applicationContext, fileStore)
-        val orchestrator = TaskOrchestrator(prefs, db, fileStore, connectionManager, pipeline)
+        val orchestrator = TaskOrchestrator(
+            prefs = prefs,
+            db = db,
+            fileStore = fileStore,
+            connectionManager = connectionManager,
+            pipeline = pipeline,
+            onHelloCurrentTaskChanged = { helloCurrentTask.set(it) },
+        )
 
         // Mirror state → NodeStateHolder (read by NodeStatusViewModel) AND notification
         orchestrator.taskState.onEach { state ->
@@ -171,14 +179,18 @@ class MediaNodeService : LifecycleService() {
                 (state.progress * 100).toInt(),
             )
             is TaskState.Done -> Triple("处理完成", state.taskId, 100)
-            is TaskState.Error -> Triple("错误", state.reason, null)
+            is TaskState.Error -> Triple(
+                if (state.recoverable) "任务中断，等待恢复" else "错误",
+                state.taskId?.let { "$it · ${state.reason}" } ?: state.reason,
+                null,
+            )
         }
 
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_upload)
             .setContentTitle(title)
             .setContentText(body)
-            .setOngoing(state !is TaskState.Done && state !is TaskState.Error)
+            .setOngoing(state !is TaskState.Done && (state !is TaskState.Error || state.recoverable))
             .addAction(android.R.drawable.ic_delete, "停止", stopPendingIntent)
             .setContentIntent(
                 PendingIntent.getActivity(

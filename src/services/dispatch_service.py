@@ -49,6 +49,18 @@ CHUNK_ACK_TIMEOUT = 30.0
 # 等待 TASK_CONFIRM 超时（秒）
 TASK_CONFIRM_TIMEOUT = 30.0
 
+# dispatch_status 的阶段序，用于防止客户端状态上报将记录回退。
+_STATUS_STAGE_ORDER: dict[str, int] = {
+    "assigned": 0,
+    "confirmed": 1,
+    "transferring": 2,
+    "running": 3,
+    "uploading": 4,
+    "done": 5,
+    "failed": 6,
+    "canceled": 6,
+}
+
 
 def _protocol_log(event: str, current: str, next_step: str, **fields: object) -> None:
     """Structured protocol logs for tracking step progression and next action."""
@@ -421,6 +433,17 @@ class DispatchService:
         }
         new_status = STATUS_MAP.get(msg.status)
         if new_status and new_status != record.dispatch_status:
+            # 仅允许推进，不允许回退（例如 running 被错误上报为 AwaitingTask/Connecting）。
+            cur_stage = _STATUS_STAGE_ORDER.get(record.dispatch_status, -1)
+            next_stage = _STATUS_STAGE_ORDER.get(new_status, -1)
+            if next_stage < cur_stage:
+                logger.warning(
+                    "忽略状态回退: task=%d current=%s reported=%s",
+                    task_id,
+                    record.dispatch_status,
+                    msg.status,
+                )
+                return
             self._dispatch_repo.update_dispatch_status(
                 record.id, new_status, msg.lastError
             )
@@ -685,6 +708,13 @@ class DispatchService:
             / msg.transferId
             / msg.fileRole
         )
+
+        # 首个有效结果分片到达即进入 uploading，避免状态长期停留在 running/confirmed。
+        if msg.chunkIndex == 0 and session.node_id:
+            record = self._dispatch_repo.get_active_record_for_node(session.node_id)
+            if record and record.dispatch_status in ("running", "confirmed", "transferring"):
+                self._dispatch_repo.update_dispatch_status(record.id, "uploading")
+
         loop = asyncio.get_running_loop()
         try:
             await loop.run_in_executor(None, _write_chunk, chunk_dir, msg.chunkIndex, payload)

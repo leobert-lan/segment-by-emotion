@@ -56,6 +56,7 @@ class UploadManager(
         const val CHUNK_SIZE = 8 * 1024 * 1024   // 8 MB
 
         private const val ACK_TIMEOUT_MS = 30_000L   // 30 s per chunk
+        private const val MAX_CHUNK_RETRIES = 3
     }
 
     /**
@@ -113,57 +114,67 @@ class UploadManager(
                 val hash    = sha256Hex(payload)
                 val idx     = chunkIndex
 
-                coroutineScope {
-                    // ── Subscribe BEFORE sending to prevent missing ACK ──
-                    // async(UNDISPATCHED) runs synchronously until the first
-                    // suspension point inside `first { }`, at which point the
-                    // SharedFlow subscriber is registered. Only then do we send.
-                    val ackDeferred = async(start = CoroutineStart.UNDISPATCHED) {
-                        dataChannel.dataEvents.first { msg ->
-                            msg is DataMessage.ChunkAck &&
-                                msg.taskId      == taskId     &&
-                                msg.transferId  == transferId &&
-                                msg.chunkIndex  == idx
+                var acked = false
+                var attempt = 1
+                while (!acked && attempt <= MAX_CHUNK_RETRIES) {
+                    coroutineScope {
+                        // ── Subscribe BEFORE sending to prevent missing ACK ──
+                        // async(UNDISPATCHED) runs synchronously until the first
+                        // suspension point inside `first { }`, at which point the
+                        // SharedFlow subscriber is registered. Only then do we send.
+                        val ackDeferred = async(start = CoroutineStart.UNDISPATCHED) {
+                            dataChannel.dataEvents.first { msg ->
+                                msg is DataMessage.ChunkAck &&
+                                    msg.taskId      == taskId     &&
+                                    msg.transferId  == transferId &&
+                                    msg.chunkIndex  == idx
+                            }
                         }
-                    }
 
-                    Log.d(
-                        TAG,
-                        "[$taskId] upload send role=$role chunk=$idx size=$read transferId=$transferId",
-                    )
-
-                    dataChannel.writeDataFrame(
-                        DataMessage.ResultChunk(
-                            taskId     = taskId,
-                            transferId = transferId,
-                            chunkIndex = idx,
-                            chunkHash  = hash,
-                            payloadSize = read,
-                            fileRole   = role,
-                        ),
-                        payload,
-                    )
-
-                    val waitStartNs = System.nanoTime()
-                    val ack = withTimeoutOrNull(ACK_TIMEOUT_MS) {
-                        ackDeferred.await()
-                    } as? DataMessage.ChunkAck
-
-                    if (ack == null) {
-                        ackDeferred.cancel()
-                        Log.w(
+                        Log.d(
                             TAG,
-                            "[$taskId] upload ack timeout role=$role chunk=$idx transferId=$transferId",
+                            "[$taskId] upload send role=$role chunk=$idx size=$read transferId=$transferId attempt=$attempt",
                         )
-                        throw IOException(
-                            "[$taskId] Timeout waiting for ChunkAck: role=$role chunk=$idx"
-                        )
-                    }
 
-                    val waitedMs = (System.nanoTime() - waitStartNs) / 1_000_000L
-                    Log.d(
-                        TAG,
-                        "[$taskId] upload ack role=$role chunk=$idx waitedMs=$waitedMs transferId=${ack.transferId}",
+                        dataChannel.writeDataFrame(
+                            DataMessage.ResultChunk(
+                                taskId     = taskId,
+                                transferId = transferId,
+                                chunkIndex = idx,
+                                chunkHash  = hash,
+                                payloadSize = read,
+                                fileRole   = role,
+                            ),
+                            payload,
+                        )
+
+                        val waitStartNs = System.nanoTime()
+                        val ack = withTimeoutOrNull(ACK_TIMEOUT_MS) {
+                            ackDeferred.await()
+                        } as? DataMessage.ChunkAck
+
+                        if (ack == null) {
+                            ackDeferred.cancel()
+                            Log.w(
+                                TAG,
+                                "[$taskId] upload ack timeout role=$role chunk=$idx transferId=$transferId attempt=$attempt/$MAX_CHUNK_RETRIES",
+                            )
+                            return@coroutineScope
+                        }
+
+                        val waitedMs = (System.nanoTime() - waitStartNs) / 1_000_000L
+                        Log.d(
+                            TAG,
+                            "[$taskId] upload ack role=$role chunk=$idx waitedMs=$waitedMs transferId=${ack.transferId}",
+                        )
+                        acked = true
+                    }
+                    attempt++
+                }
+
+                if (!acked) {
+                    throw IOException(
+                        "[$taskId] Timeout waiting for ChunkAck: role=$role chunk=$idx"
                     )
                 }
 

@@ -41,7 +41,7 @@ fun NodeStatusScreen(
         Text(text = "节点状态", style = MaterialTheme.typography.headlineSmall)
 
         // State badge
-        val (chipLabel, chipColor) = stateChip(state)
+        val (chipLabel, _) = stateChip(state)
         AssistChip(
             onClick = {},
             label = { Text(chipLabel) },
@@ -76,6 +76,15 @@ fun NodeStatusScreen(
                         val s = state as TaskState.Done
                         Text("任务 ID: ${s.taskId}")
                         Text("✓ 处理完成", color = Color(0xFF2E7D32))
+                    }
+                    is TaskState.Error -> {
+                        val s = state as TaskState.Error
+                        s.taskId?.let { Text("任务 ID: $it") }
+                        Text(
+                            if (s.recoverable) "任务中断，连接恢复后将自动重试" else "任务失败，需要人工处理",
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                        Text("原因: ${s.reason}")
                     }
                     is TaskState.Connecting -> {
                         val s = state as TaskState.Connecting
