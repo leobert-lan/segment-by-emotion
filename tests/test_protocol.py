@@ -15,6 +15,7 @@ from pathlib import Path
 
 from src.net.protocol.control_message import (
     CurrentTaskSnapshot,
+    MsgHeartbeat,
     MsgHello,
     MsgHelloAck,
     MsgTaskAssign,
@@ -170,6 +171,16 @@ class TestControlMessageRoundtrip(unittest.TestCase):
         result = decode_control(json.dumps(d))
         self.assertIsInstance(result, dict)
         self.assertEqual(result["type"], "UNKNOWN_MSG")
+
+    def test_heartbeat_decode(self) -> None:
+        d = {
+            "type": "HEARTBEAT",
+            "requestId": "req-hb-001",
+            "sentAt": "2026-03-25T00:00:00Z",
+        }
+        msg = decode_control(json.dumps(d))
+        self.assertIsInstance(msg, MsgHeartbeat)
+        self.assertEqual(msg.requestId, "req-hb-001")
 
 
 # ── 数据消息往返测试 ────────────────────────────────────────────────────────────

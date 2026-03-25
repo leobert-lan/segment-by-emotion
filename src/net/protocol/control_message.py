@@ -162,6 +162,19 @@ class MsgTaskStatusReport:
         )
 
 
+@dataclass
+class MsgHeartbeat:
+    requestId: str
+    sentAt: str
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MsgHeartbeat":
+        return cls(
+            requestId=str(d["requestId"]),
+            sentAt=str(d.get("sentAt", "")),
+        )
+
+
 # ── Server → Node 消息 ────────────────────────────────────────────────────────
 
 @dataclass
@@ -217,6 +230,7 @@ ControlMessage = (
     MsgHello
     | MsgTaskConfirm
     | MsgTaskStatusReport
+    | MsgHeartbeat
     | MsgHelloAck
     | MsgTaskAssign
     | MsgTaskStatusQuery
@@ -240,5 +254,7 @@ def decode_control(line: str) -> Any:
         return MsgTaskConfirm.from_dict(d)
     if t == "TASK_STATUS_REPORT":
         return MsgTaskStatusReport.from_dict(d)
+    if t == "HEARTBEAT":
+        return MsgHeartbeat.from_dict(d)
     return d
 
