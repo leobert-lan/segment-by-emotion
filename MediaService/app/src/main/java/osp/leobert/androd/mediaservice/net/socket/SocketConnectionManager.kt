@@ -2,9 +2,8 @@ package osp.leobert.androd.mediaservice.net.socket
 
 import android.util.Log
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 
@@ -95,14 +94,21 @@ class SocketConnectionManager(
     suspend fun awaitUnexpectedDisconnect(): UnexpectedDisconnect {
         val ctrl = controlChannel ?: error("Control channel not connected")
         val data = dataChannel ?: error("Data channel not connected")
-        return merge(
-            ctrl.disconnectEvents.map {
-                UnexpectedDisconnect(channel = "control", reason = it.reason, cause = it.cause)
-            },
-            data.disconnectEvents.map {
-                UnexpectedDisconnect(channel = "data", reason = it.reason, cause = it.cause)
-            },
-        ).first()
+        return combine(ctrl.disconnectEvents, data.disconnectEvents) { ctrlEvent, dataEvent ->
+            when {
+                ctrlEvent != null -> UnexpectedDisconnect(
+                    channel = "control",
+                    reason = ctrlEvent.reason,
+                    cause = ctrlEvent.cause,
+                )
+                dataEvent != null -> UnexpectedDisconnect(
+                    channel = "data",
+                    reason = dataEvent.reason,
+                    cause = dataEvent.cause,
+                )
+                else -> null
+            }
+        }.first { it != null }!!
     }
 
     private suspend fun openBothChannels() {

@@ -6,7 +6,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancelAndJoin
-import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -50,11 +50,11 @@ class DataChannelClient(
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val writeMutex = Mutex()
 
-    private val _dataEvents = MutableSharedFlow<DataMessage>(extraBufferCapacity = 64)
+    private val _dataEvents = kotlinx.coroutines.flow.MutableSharedFlow<DataMessage>(extraBufferCapacity = 64)
     /** Non-chunk data events (TransferComplete, etc.) for the orchestrator. */
     val dataEvents: SharedFlow<DataMessage> = _dataEvents
-    private val _disconnectEvents = MutableSharedFlow<DisconnectEvent>(extraBufferCapacity = 1)
-    val disconnectEvents: SharedFlow<DisconnectEvent> = _disconnectEvents
+    private val _disconnectEvent = MutableStateFlow<DisconnectEvent?>(null)
+    val disconnectEvents: kotlinx.coroutines.flow.StateFlow<DisconnectEvent?> = _disconnectEvent
 
     private var socket: Socket? = null
     private var readJob: Job? = null
@@ -67,6 +67,7 @@ class DataChannelClient(
     suspend fun connect() = withContext(Dispatchers.IO) {
         Log.i(TAG, "[$connId] connect start host=$host port=$port")
         disconnectExpected = false
+        _disconnectEvent.value = null
         val s = Socket(host, port).apply {
             keepAlive = true
             tcpNoDelay = true
@@ -86,12 +87,23 @@ class DataChannelClient(
     suspend fun writeDataFrame(message: DataMessage, payload: ByteArray? = null) =
         withContext(Dispatchers.IO) {
             writeMutex.withLock {
-                val out = socket?.getOutputStream() ?: error("Data channel not connected")
+                val out = socket?.getOutputStream() ?: run {
+                    notifyUnexpectedDisconnect("Data channel not connected")
+                    error("Data channel not connected")
+                }
                 Log.d(
                     TAG,
                     "[$connId] send type=${message.type} payloadBytes=${payload?.size ?: 0}",
                 )
-                MessageFramer.writeDataFrame(out, message, payload)
+                runCatching {
+                    MessageFramer.writeDataFrame(out, message, payload)
+                }.getOrElse { e ->
+                    notifyUnexpectedDisconnect(
+                        reason = "Data write failed: ${e.message ?: "unknown"}",
+                        cause = e,
+                    )
+                    throw e
+                }
             }
         }
 
@@ -102,6 +114,14 @@ class DataChannelClient(
         withContext(Dispatchers.IO) { socket?.close() }
         socket = null
         Log.i(TAG, "[$connId] disconnect done")
+    }
+
+    private fun notifyUnexpectedDisconnect(reason: String, cause: Throwable? = null) {
+        if (disconnectExpected) return
+        socket = null
+        if (_disconnectEvent.value == null) {
+            _disconnectEvent.value = DisconnectEvent(reason, cause)
+        }
     }
 
     private suspend fun readLoop(s: Socket) {
@@ -166,13 +186,17 @@ class DataChannelClient(
         } catch (e: Exception) {
             // Socket closed or IO error — connection manager handles reconnect.
             Log.w(TAG, "[$connId] readLoop exception error=${e.message}", e)
+            notifyUnexpectedDisconnect(
+                reason = "Data read failed: ${e.message ?: "unknown"}",
+                cause = e,
+            )
         } finally {
             if (socket === s) {
                 socket = null
             }
             if (!disconnectExpected) {
                 val reason = if (s.isClosed) "Data socket closed unexpectedly" else "Data read loop ended"
-                _disconnectEvents.tryEmit(DisconnectEvent(reason))
+                notifyUnexpectedDisconnect(reason)
             }
             Log.d(TAG, "[$connId] readLoop exit")
         }

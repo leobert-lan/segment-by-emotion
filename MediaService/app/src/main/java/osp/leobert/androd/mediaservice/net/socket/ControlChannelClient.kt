@@ -6,7 +6,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancelAndJoin
-import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -43,10 +43,10 @@ class ControlChannelClient(
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    private val _incomingMessages = MutableSharedFlow<ControlMessage>(extraBufferCapacity = 64)
+    private val _incomingMessages = kotlinx.coroutines.flow.MutableSharedFlow<ControlMessage>(extraBufferCapacity = 64)
     val incomingMessages: SharedFlow<ControlMessage> = _incomingMessages
-    private val _disconnectEvents = MutableSharedFlow<DisconnectEvent>(extraBufferCapacity = 1)
-    val disconnectEvents: SharedFlow<DisconnectEvent> = _disconnectEvents
+    private val _disconnectEvent = MutableStateFlow<DisconnectEvent?>(null)
+    val disconnectEvents: kotlinx.coroutines.flow.StateFlow<DisconnectEvent?> = _disconnectEvent
 
     private var socket: Socket? = null
     private val writeMutex = Mutex()
@@ -65,6 +65,7 @@ class ControlChannelClient(
     suspend fun connect() = withContext(Dispatchers.IO) {
         Log.i(TAG, "[$connId] connect start host=$host port=$port")
         disconnectExpected = false
+        _disconnectEvent.value = null
         val s = Socket(host, port).apply {
             keepAlive = true
             tcpNoDelay = true
@@ -86,15 +87,26 @@ class ControlChannelClient(
      */
     suspend fun send(message: ControlMessage) = withContext(Dispatchers.IO) {
         writeMutex.withLock {
-            val sock = socket ?: error("Control channel not connected")
+            val sock = socket ?: run {
+                notifyUnexpectedDisconnect("Control channel not connected")
+                error("Control channel not connected")
+            }
             val encoded = MessageFramer.encodeControl(message)
             val bytes = encoded.toByteArray(Charsets.UTF_8)
             Log.d(
                 TAG,
                 "[$connId] send type=${message.type} requestId=${message.requestId} bytes=${bytes.size}\r\n content=$encoded",
             )
-            sock.getOutputStream().write(bytes)
-            sock.getOutputStream().flush()
+            runCatching {
+                sock.getOutputStream().write(bytes)
+                sock.getOutputStream().flush()
+            }.getOrElse { e ->
+                notifyUnexpectedDisconnect(
+                    reason = "Control write failed: ${e.message ?: "unknown"}",
+                    cause = e,
+                )
+                throw e
+            }
         }
     }
 
@@ -105,6 +117,14 @@ class ControlChannelClient(
         withContext(Dispatchers.IO) { socket?.close() }
         socket = null
         Log.i(TAG, "[$connId] disconnect done")
+    }
+
+    private fun notifyUnexpectedDisconnect(reason: String, cause: Throwable? = null) {
+        if (disconnectExpected) return
+        socket = null
+        if (_disconnectEvent.value == null) {
+            _disconnectEvent.value = DisconnectEvent(reason, cause)
+        }
     }
 
     private suspend fun readLoop(s: Socket) {
@@ -129,13 +149,17 @@ class ControlChannelClient(
         } catch (e: Exception) {
             // Socket closed or IO error — connection manager handles reconnect.
             Log.w(TAG, "[$connId] readLoop exception error=${e.message}", e)
+            notifyUnexpectedDisconnect(
+                reason = "Control read failed: ${e.message ?: "unknown"}",
+                cause = e,
+            )
         } finally {
             if (socket === s) {
                 socket = null
             }
             if (!disconnectExpected) {
                 val reason = if (s.isClosed) "Control socket closed unexpectedly" else "Control read loop ended"
-                _disconnectEvents.tryEmit(DisconnectEvent(reason))
+                notifyUnexpectedDisconnect(reason)
             }
             Log.d(TAG, "[$connId] readLoop exit")
         }
