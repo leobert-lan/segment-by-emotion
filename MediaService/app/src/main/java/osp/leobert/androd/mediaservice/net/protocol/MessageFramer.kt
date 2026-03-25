@@ -71,6 +71,10 @@ object MessageFramer {
     private fun parseControlMessage(json: JsonObject): ControlMessage {
         return when (json.getRequiredString("type")) {
             "HELLO" -> gson.fromJson(json, ControlMessage.Hello::class.java)
+            "HEARTBEAT" -> gson.fromJson(json, ControlMessage.Heartbeat::class.java)
+            "HEARTBEAT_ACK" -> gson.fromJson(json, ControlMessage.HeartbeatAck::class.java)
+            "PING" -> gson.fromJson(json, ControlMessage.Ping::class.java)
+            "PONG" -> gson.fromJson(json, ControlMessage.Pong::class.java)
             "TASK_STATUS_REPORT" -> gson.fromJson(json, ControlMessage.TaskStatusReport::class.java)
             "TASK_CONFIRM" -> gson.fromJson(json, ControlMessage.TaskConfirm::class.java)
             "HELLO_ACK" -> gson.fromJson(json, ControlMessage.HelloAck::class.java)

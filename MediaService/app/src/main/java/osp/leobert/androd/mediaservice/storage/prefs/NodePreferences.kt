@@ -7,6 +7,7 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import java.util.UUID
@@ -34,9 +35,7 @@ class NodePreferences(private val context: Context) {
     val serverHost: Flow<String> = context.dataStore.data.map { it[KEY_SERVER_HOST] ?: "" }
     val controlPort: Flow<Int> = context.dataStore.data.map { it[KEY_CONTROL_PORT] ?: DEFAULT_CONTROL_PORT }
     val dataPort: Flow<Int> = context.dataStore.data.map { it[KEY_DATA_PORT] ?: DEFAULT_DATA_PORT }
-    val nodeId: Flow<String> = context.dataStore.data.map {
-        it[KEY_NODE_ID] ?: UUID.randomUUID().toString()
-    }
+    val nodeId: Flow<String> = context.dataStore.data.map { it[KEY_NODE_ID] ?: "" }
     val nodeVersion: Flow<String> = context.dataStore.data.map {
         it[KEY_NODE_VERSION] ?: DEFAULT_NODE_VERSION
     }
@@ -59,14 +58,16 @@ class NodePreferences(private val context: Context) {
 
     /** Ensures a nodeId exists; generates and persists one if not. */
     suspend fun ensureNodeId(): String {
-        val prefs = context.dataStore.data.map { it[KEY_NODE_ID] }
-        // Read once synchronously via first emission is done in the caller via collect.
-        // Callers should use nodeId Flow; this helper is for one-shot initialization.
+        val existing = context.dataStore.data.first()[KEY_NODE_ID]
+        if (!existing.isNullOrBlank()) return existing
+
         val id = UUID.randomUUID().toString()
-        context.dataStore.edit { prefs2 ->
-            if (prefs2[KEY_NODE_ID] == null) prefs2[KEY_NODE_ID] = id
+        context.dataStore.edit { prefs ->
+            if (prefs[KEY_NODE_ID].isNullOrBlank()) {
+                prefs[KEY_NODE_ID] = id
+            }
         }
-        return id
+        return context.dataStore.data.first()[KEY_NODE_ID] ?: id
     }
 }
 

@@ -9,11 +9,17 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.CenterAlignedTopAppBar
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -28,6 +34,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 /**
  * 连接配置界面：输入服务器 IP、端口和节点 ID，点击"连接"启动 MediaNodeService。
  */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ConnectionScreen(
     onConnected: () -> Unit,
@@ -45,74 +52,89 @@ fun ConnectionScreen(
     var dataPort by remember(savedDataPort) { mutableStateOf(savedDataPort.toString()) }
     var nodeId by remember(savedNodeId) { mutableStateOf(savedNodeId) }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(24.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        Text(text = "媒体节点 — 连接配置", style = MaterialTheme.typography.headlineSmall)
-
-        Spacer(Modifier.height(8.dp))
-
-        OutlinedTextField(
-            value = host,
-            onValueChange = { host = it },
-            label = { Text("服务器地址 (IP / 主机名)") },
-            placeholder = { Text("例：192.168.1.100") },
-            modifier = Modifier.fillMaxWidth(),
-            singleLine = true,
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
-        )
-
-        Row(modifier = Modifier.fillMaxWidth()) {
-            OutlinedTextField(
-                value = controlPort,
-                onValueChange = { controlPort = it },
-                label = { Text("控制端口") },
-                modifier = Modifier.weight(1f),
-                singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+    Scaffold(
+        topBar = {
+            CenterAlignedTopAppBar(
+                title = { Text("媒体节点") },
+                colors = TopAppBarDefaults.topAppBarColors(),
             )
-            Spacer(Modifier.width(12.dp))
-            OutlinedTextField(
-                value = dataPort,
-                onValueChange = { dataPort = it },
-                label = { Text("数据端口") },
-                modifier = Modifier.weight(1f),
-                singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-            )
-        }
-
-        OutlinedTextField(
-            value = nodeId,
-            onValueChange = { nodeId = it },
-            label = { Text("节点 ID") },
-            placeholder = { Text("留空自动生成") },
-            modifier = Modifier.fillMaxWidth(),
-            singleLine = true,
-        )
-
-        if (error != null) {
-            Text(text = error!!, color = MaterialTheme.colorScheme.error)
-        }
-
-        Spacer(Modifier.height(8.dp))
-
-        Button(
-            onClick = {
-                if (nodeId.isNotBlank()) vm.saveNodeId(nodeId)
-                vm.connect(
-                    host = host,
-                    controlPort = controlPort.toIntOrNull() ?: 23010,
-                    dataPort = dataPort.toIntOrNull() ?: 23011,
-                )
-                onConnected()
-            },
-            modifier = Modifier.fillMaxWidth(),
+        },
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+                .padding(horizontal = 24.dp, vertical = 16.dp)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Text("连接")
+            Text(text = "连接配置", style = MaterialTheme.typography.headlineSmall)
+            Text(
+                text = "填写服务端地址后即可进入待命状态，任务会在后台服务中持续执行。",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+
+            Spacer(Modifier.height(8.dp))
+
+            OutlinedTextField(
+                value = host,
+                onValueChange = { host = it },
+                label = { Text("服务器地址 (IP / 主机名)") },
+                placeholder = { Text("例：192.168.1.100") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+            )
+
+            Row(modifier = Modifier.fillMaxWidth()) {
+                OutlinedTextField(
+                    value = controlPort,
+                    onValueChange = { controlPort = it },
+                    label = { Text("控制端口") },
+                    modifier = Modifier.weight(1f),
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                )
+                Spacer(Modifier.width(12.dp))
+                OutlinedTextField(
+                    value = dataPort,
+                    onValueChange = { dataPort = it },
+                    label = { Text("数据端口") },
+                    modifier = Modifier.weight(1f),
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                )
+            }
+
+            OutlinedTextField(
+                value = nodeId,
+                onValueChange = { nodeId = it },
+                label = { Text("节点 ID") },
+                placeholder = { Text("留空自动生成并持久化") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+            )
+
+            if (error != null) {
+                Text(text = error!!, color = MaterialTheme.colorScheme.error)
+            }
+
+            Spacer(Modifier.height(8.dp))
+
+            Button(
+                onClick = {
+                    if (nodeId.isNotBlank()) vm.saveNodeId(nodeId)
+                    vm.connect(
+                        host = host,
+                        controlPort = controlPort.toIntOrNull() ?: 23010,
+                        dataPort = dataPort.toIntOrNull() ?: 23011,
+                    )
+                    onConnected()
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("连接")
+            }
         }
     }
 }

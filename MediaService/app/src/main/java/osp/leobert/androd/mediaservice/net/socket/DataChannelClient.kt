@@ -38,6 +38,11 @@ class DataChannelClient(
     private val onTransferComplete: suspend (DataMessage.TransferComplete) -> Unit,
 ) {
 
+    data class DisconnectEvent(
+        val reason: String,
+        val cause: Throwable? = null,
+    )
+
     companion object {
         private const val TAG = "DataChannelClient"
     }
@@ -48,16 +53,24 @@ class DataChannelClient(
     private val _dataEvents = MutableSharedFlow<DataMessage>(extraBufferCapacity = 64)
     /** Non-chunk data events (TransferComplete, etc.) for the orchestrator. */
     val dataEvents: SharedFlow<DataMessage> = _dataEvents
+    private val _disconnectEvents = MutableSharedFlow<DisconnectEvent>(extraBufferCapacity = 1)
+    val disconnectEvents: SharedFlow<DisconnectEvent> = _disconnectEvents
 
     private var socket: Socket? = null
     private var readJob: Job? = null
     private val connId: String = Integer.toHexString(System.identityHashCode(this))
+    @Volatile
+    private var disconnectExpected: Boolean = false
 
     val isConnected: Boolean get() = socket?.isConnected == true && socket?.isClosed == false
 
     suspend fun connect() = withContext(Dispatchers.IO) {
         Log.i(TAG, "[$connId] connect start host=$host port=$port")
-        val s = Socket(host, port)
+        disconnectExpected = false
+        val s = Socket(host, port).apply {
+            keepAlive = true
+            tcpNoDelay = true
+        }
         socket = s
         Log.i(
             TAG,
@@ -84,6 +97,7 @@ class DataChannelClient(
 
     suspend fun disconnect() {
         Log.i(TAG, "[$connId] disconnect start isConnected=$isConnected")
+        disconnectExpected = true
         readJob?.cancelAndJoin()
         withContext(Dispatchers.IO) { socket?.close() }
         socket = null
@@ -153,6 +167,13 @@ class DataChannelClient(
             // Socket closed or IO error — connection manager handles reconnect.
             Log.w(TAG, "[$connId] readLoop exception error=${e.message}", e)
         } finally {
+            if (socket === s) {
+                socket = null
+            }
+            if (!disconnectExpected) {
+                val reason = if (s.isClosed) "Data socket closed unexpectedly" else "Data read loop ended"
+                _disconnectEvents.tryEmit(DisconnectEvent(reason))
+            }
             Log.d(TAG, "[$connId] readLoop exit")
         }
     }

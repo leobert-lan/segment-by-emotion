@@ -15,7 +15,7 @@
 
 ### 2.1 控制通道（23010）
 
-- Node -> Server: `HELLO`, `TASK_CONFIRM`, `TASK_STATUS_REPORT`
+- Node -> Server: `HELLO`, `HEARTBEAT`, `TASK_CONFIRM`, `TASK_STATUS_REPORT`
 - Server -> Node: `HELLO_ACK`, `TASK_ASSIGN`, `TASK_STATUS_QUERY`
 
 ### 2.2 数据通道（23011）
@@ -32,6 +32,8 @@
 - ACK 超时：30s（下发 ACK、上传 ACK）
 - 通道配对超时：30s（控制等数据；数据等控制）
 - HELLO 等待超时：30s
+- 心跳发送间隔：15s（Android -> Python `HEARTBEAT`）
+- 心跳离线阈值：45s（Python watchdog）
 
 ## 3.1 实现对齐约束（联调必须遵守）
 
@@ -107,6 +109,7 @@ sequenceDiagram
     N->>DS: RESULT_TRANSFER_COMPLETE(totalHash)
     DS->>FS: ingest + hash校验 + 文件组装
     DS->>GUI: 状态 done
+    DS->>N: 自动续派下一条 review_done（若存在）
 
 落盘约定（验收通过后）：
 

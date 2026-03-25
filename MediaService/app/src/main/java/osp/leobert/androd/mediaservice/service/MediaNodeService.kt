@@ -7,6 +7,7 @@ import android.content.Intent
 import androidx.core.app.NotificationCompat
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
@@ -56,6 +57,7 @@ class MediaNodeService : LifecycleService() {
     }
 
     private var orchestratorJob: Job? = null
+    private var stateMirrorJob: Job? = null
     private lateinit var notificationManager: NotificationManager
     private var activeConnectionConfig: ConnectionConfig? = null
 
@@ -87,6 +89,8 @@ class MediaNodeService : LifecycleService() {
             orchestratorJob?.cancel()
             orchestratorJob = null
         }
+        stateMirrorJob?.cancel()
+        stateMirrorJob = null
         activeConnectionConfig = requestedConfig
 
         startForeground(NOTIFICATION_ID, buildNotification(TaskState.Connecting(host, controlPort, dataPort)))
@@ -94,67 +98,73 @@ class MediaNodeService : LifecycleService() {
         val prefs = NodePreferences(applicationContext)
         val db = AppDatabase.getInstance(applicationContext)
         val fileStore = FileStoreManager(applicationContext)
-        val helloCurrentTask = AtomicReference<ControlMessage.CurrentTaskSnapshot?>(null)
+        orchestratorJob = lifecycleScope.launch {
+            val helloCurrentTask = AtomicReference<ControlMessage.CurrentTaskSnapshot?>(null)
+            val stableNodeId = prefs.ensureNodeId()
+            val nodeVersion = prefs.nodeVersion.first()
 
-        val connectionManager = SocketConnectionManager(
-            host = host,
-            controlPort = controlPort,
-            dataPort = dataPort,
-            controlClientFactory = { h, p ->
-                ControlChannelClient(h, p) {
-                    ControlMessage.Hello(
-                        requestId = UUID.randomUUID().toString(),
-                        nodeId = "android-node",  // TODO: read from prefs
-                        nodeVersion = NodePreferences.DEFAULT_NODE_VERSION,
-                        capabilities = ControlMessage.NodeCapabilities(
-                            gpu = true,
-                            codec = listOf("hevc", "avc"),
-                        ),
-                        currentTask = helloCurrentTask.get(),
-                    )
-                }
-            },
-            dataClientFactory = { h, p ->
-                DataChannelClient(
-                    host = h,
-                    port = p,
-                    onChunkReceived = { chunk, payload ->
-                        fileStore.writeChunkPayload(chunk.taskId, chunk.chunkIndex, payload)
-                        db.chunkDao().markReceived(chunk.taskId, chunk.chunkIndex)
-                        db.taskDao().updateTransferId(
-                            taskId = chunk.taskId,
-                            transferId = chunk.transferId,
-                            updatedAt = Instant.now().toString(),
+            val connectionManager = SocketConnectionManager(
+                host = host,
+                controlPort = controlPort,
+                dataPort = dataPort,
+                controlClientFactory = { h, p ->
+                    ControlChannelClient(h, p) {
+                        ControlMessage.Hello(
+                            requestId = UUID.randomUUID().toString(),
+                            nodeId = stableNodeId,
+                            nodeVersion = nodeVersion,
+                            capabilities = ControlMessage.NodeCapabilities(
+                                gpu = true,
+                                codec = listOf("hevc", "avc"),
+                            ),
+                            currentTask = helloCurrentTask.get(),
                         )
-                        true
-                    },
-                    onTransferComplete = { /* handled in DataChannelClient dataEvents */ },
-                )
-            },
-        )
+                    }
+                },
+                dataClientFactory = { h, p ->
+                    DataChannelClient(
+                        host = h,
+                        port = p,
+                        onChunkReceived = { chunk, payload ->
+                            fileStore.writeChunkPayload(chunk.taskId, chunk.chunkIndex, payload)
+                            db.chunkDao().markReceived(chunk.taskId, chunk.chunkIndex)
+                            db.taskDao().updateTransferId(
+                                taskId = chunk.taskId,
+                                transferId = chunk.transferId,
+                                updatedAt = Instant.now().toString(),
+                            )
+                            true
+                        },
+                        onTransferComplete = { /* handled in DataChannelClient dataEvents */ },
+                    )
+                },
+            )
 
-        val pipeline = MediaPipeline(applicationContext, fileStore)
-        val orchestrator = TaskOrchestrator(
-            prefs = prefs,
-            db = db,
-            fileStore = fileStore,
-            connectionManager = connectionManager,
-            pipeline = pipeline,
-            onHelloCurrentTaskChanged = { helloCurrentTask.set(it) },
-        )
+            val pipeline = MediaPipeline(applicationContext, fileStore)
+            val orchestrator = TaskOrchestrator(
+                prefs = prefs,
+                db = db,
+                fileStore = fileStore,
+                connectionManager = connectionManager,
+                pipeline = pipeline,
+                onHelloCurrentTaskChanged = { helloCurrentTask.set(it) },
+            )
 
-        // Mirror state → NodeStateHolder (read by NodeStatusViewModel) AND notification
-        orchestrator.taskState.onEach { state ->
-            NodeStateHolder.update(state)
-            notificationManager.notify(NOTIFICATION_ID, buildNotification(state))
-        }.launchIn(lifecycleScope)
+            stateMirrorJob?.cancel()
+            stateMirrorJob = orchestrator.taskState.onEach { state ->
+                NodeStateHolder.update(state)
+                notificationManager.notify(NOTIFICATION_ID, buildNotification(state))
+            }.launchIn(lifecycleScope)
 
-        orchestratorJob = lifecycleScope.launch { orchestrator.run() }
+            orchestrator.run()
+        }
     }
 
     private fun handleDisconnect() {
         orchestratorJob?.cancel()
         orchestratorJob = null
+        stateMirrorJob?.cancel()
+        stateMirrorJob = null
         activeConnectionConfig = null
         NodeStateHolder.update(TaskState.Idle)
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -173,13 +183,6 @@ class MediaNodeService : LifecycleService() {
     }
 
     private fun buildNotification(state: TaskState): android.app.Notification {
-        val stopIntent = Intent(this, MediaNodeService::class.java).apply {
-            action = ACTION_DISCONNECT
-        }
-        val stopPendingIntent = PendingIntent.getService(
-            this, 0, stopIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-
         val (title, body, progress) = when (state) {
             is TaskState.Idle -> Triple("节点待机", "未连接", null)
             is TaskState.Connecting -> Triple("连接中…", "${state.host}:${state.controlPort}", null)
@@ -210,7 +213,6 @@ class MediaNodeService : LifecycleService() {
             .setContentTitle(title)
             .setContentText(body)
             .setOngoing(state !is TaskState.Done && (state !is TaskState.Error || state.recoverable))
-            .addAction(android.R.drawable.ic_delete, "停止", stopPendingIntent)
             .setContentIntent(
                 PendingIntent.getActivity(
                     this, 0,

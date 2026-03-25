@@ -3,6 +3,7 @@ package osp.leobert.androd.mediaservice
 
 import android.content.Intent
 import android.os.Bundle
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -12,9 +13,7 @@ import androidx.compose.ui.Modifier
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
-import osp.leobert.androd.mediaservice.domain.state.TaskState
 import osp.leobert.androd.mediaservice.service.MediaNodeService
-import osp.leobert.androd.mediaservice.service.NodeStateHolder
 import osp.leobert.androd.mediaservice.storage.db.AppDatabase
 import osp.leobert.androd.mediaservice.storage.prefs.NodePreferences
 import osp.leobert.androd.mediaservice.ui.navigation.AppNavHost
@@ -24,6 +23,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         resumePendingTaskIfNeeded()
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         enableEdgeToEdge()
         setContent {
             MediaServiceTheme {

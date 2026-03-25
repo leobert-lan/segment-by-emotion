@@ -73,6 +73,58 @@ sealed class ControlMessage {
     ) : ControlMessage()
 
     /**
+     * Lightweight keepalive sent periodically by node.
+     */
+    data class Heartbeat(
+        @SerializedName("requestId")
+        override val requestId: String,
+        @SerializedName("type")
+        override val type: String = "HEARTBEAT",
+        @SerializedName("sentAt")
+        val sentAt: String? = null,
+    ) : ControlMessage()
+
+    /**
+     * Acknowledges a peer heartbeat.
+     */
+    data class HeartbeatAck(
+        @SerializedName("requestId")
+        override val requestId: String,
+        @SerializedName("type")
+        override val type: String = "HEARTBEAT_ACK",
+        @SerializedName("replyToRequestId")
+        val replyToRequestId: String? = null,
+        @SerializedName("receivedAt")
+        val receivedAt: String? = null,
+    ) : ControlMessage()
+
+    /**
+     * Lightweight ping used by Python heartbeat watchdogs.
+     */
+    data class Ping(
+        @SerializedName("requestId")
+        override val requestId: String,
+        @SerializedName("type")
+        override val type: String = "PING",
+        @SerializedName("sentAt")
+        val sentAt: String? = null,
+    ) : ControlMessage()
+
+    /**
+     * Response for [Ping].
+     */
+    data class Pong(
+        @SerializedName("requestId")
+        override val requestId: String,
+        @SerializedName("type")
+        override val type: String = "PONG",
+        @SerializedName("replyToRequestId")
+        val replyToRequestId: String? = null,
+        @SerializedName("sentAt")
+        val sentAt: String? = null,
+    ) : ControlMessage()
+
+    /**
      * Accept or reject a [TaskAssign].
      */
     data class TaskConfirm(

@@ -823,6 +823,7 @@ class DispatchService:
                 f"task={task_id} hash={msg.totalHash[:8]}...",
                 record.id,
             )
+            await self._auto_dispatch_next_review_done(node_id, just_finished_task_id=task_id)
         except Exception as exc:
             logger.exception("结果验收失败: task=%d: %s", task_id, exc)
             self._dispatch_repo.update_dispatch_status(record.id, "failed", str(exc))
@@ -847,6 +848,38 @@ class DispatchService:
 
     def list_dispatch_records(self, task_id: int):
         return self._dispatch_repo.list_records_for_task(task_id)
+
+    async def _auto_dispatch_next_review_done(
+        self, node_id: str, just_finished_task_id: int
+    ) -> None:
+        session = self._find_session(node_id)
+        if session is None:
+            return
+
+        for task in self._task_repo.list_tasks():
+            if task.status != "review_done":
+                continue
+            if task.id == just_finished_task_id:
+                continue
+
+            records = self._dispatch_repo.list_records_for_task(task.id)
+            if records:
+                # 自动续派只消费未下发过的 review_done 任务，失败/重试留给人工确认。
+                continue
+
+            try:
+                await self.dispatch_task(task.id, node_id)
+                logger.info("自动续派成功: task=%d node=%s", task.id, node_id)
+                return
+            except Exception as exc:
+                logger.warning(
+                    "自动续派失败，继续扫描下一任务: task=%d node=%s err=%s",
+                    task.id,
+                    node_id,
+                    exc,
+                )
+
+        logger.info("自动续派结束：无可下发 review_done 任务 node=%s", node_id)
 
     # ── 工具 ──────────────────────────────────────────────────────────────────
 

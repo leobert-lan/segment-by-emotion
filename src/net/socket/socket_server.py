@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 from src.net.socket.node_session import NodeSession
@@ -32,6 +33,8 @@ _PAIR_TIMEOUT = 30.0
 _HELLO_TIMEOUT = 30.0
 # 数据通道先到达时，等待控制通道的超时（秒）
 _PENDING_DATA_TIMEOUT = 30.0
+_HEARTBEAT_INTERVAL = 5.0
+_HEARTBEAT_TIMEOUT = 45.0
 
 
 def _protocol_log(event: str, current: str, next_step: str, **fields: Any) -> None:
@@ -78,6 +81,7 @@ class SocketServer:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._stop_event: Optional[asyncio.Event] = None
+        self._watchdog_task: Optional[asyncio.Task[None]] = None
 
     # ── 启动 / 停止 ───────────────────────────────────────────────────────────
 
@@ -151,8 +155,15 @@ class SocketServer:
         logger.info(
             "监听 ctrl=%d data=%d", self._control_port, self._data_port
         )
+        self._watchdog_task = asyncio.create_task(self._heartbeat_watchdog())
         async with ctrl_srv, data_srv:
             await self._stop_event.wait()  # type: ignore[union-attr]
+        if self._watchdog_task is not None:
+            self._watchdog_task.cancel()
+            try:
+                await self._watchdog_task
+            except asyncio.CancelledError:
+                pass
         logger.info("SocketServer 已停止")
 
     async def _signal_stop(self) -> None:
@@ -422,6 +433,31 @@ class SocketServer:
             self._active.pop(node_id, None)
             if self._on_session_closed:
                 self._on_session_closed(session)
+
+    async def _heartbeat_watchdog(self) -> None:
+        while True:
+            await asyncio.sleep(_HEARTBEAT_INTERVAL)
+            now = datetime.now(timezone.utc)
+            sessions = list(self._active.values())
+            for session in sessions:
+                if session.status == "offline":
+                    continue
+                idle_sec = (now - session.last_seen_at).total_seconds()
+                if idle_sec <= _HEARTBEAT_TIMEOUT:
+                    continue
+                logger.warning(
+                    "心跳超时，关闭会话: node=%s idle=%.1fs", session.node_id, idle_sec
+                )
+                _protocol_log(
+                    "heartbeat_timeout",
+                    "session idle over heartbeat timeout",
+                    "node should reconnect and send HELLO",
+                    node_id=session.node_id,
+                    peer_ip=session.peer_ip,
+                    idle_sec=round(idle_sec, 1),
+                    timeout_sec=_HEARTBEAT_TIMEOUT,
+                )
+                await self._handle_session_disconnect(session, reason="heartbeat_timeout")
 
     # ── 内部 async 发送 ───────────────────────────────────────────────────────
 

@@ -3,8 +3,13 @@ package osp.leobert.androd.mediaservice.service
 import android.annotation.SuppressLint
 import android.util.Log
 import com.google.gson.Gson
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -48,6 +53,7 @@ class TaskOrchestrator(
 
     companion object {
         private const val TAG = "TaskOrchestrator"
+        private const val HEARTBEAT_INTERVAL_MS = 15_000L
     }
 
     private val gson = Gson()
@@ -59,6 +65,7 @@ class TaskOrchestrator(
     private var currentTask: NodeTask? = null
     private var pendingRecovery: PendingRecovery? = null
     private var recoveryJob: Job? = null
+    private var heartbeatJob: Job? = null
 
     private enum class RecoveryAction {
         RESUME_RECEIVE,
@@ -81,6 +88,10 @@ class TaskOrchestrator(
         val stage: String?,
         val lastError: String?,
     )
+
+    private class ConnectionLostException(
+        val disconnect: SocketConnectionManager.UnexpectedDisconnect,
+    ) : CancellationException(disconnect.reason)
 
     private fun emitState(state: TaskState) {
         _taskState.value = state
@@ -117,28 +128,108 @@ class TaskOrchestrator(
             } else {
                 Log.i(TAG, "Connecting with recovered task kept visible in UI")
             }
-            connectionManager.connectWithRetry()
+            var hasConnectedOnce = false
+            while (currentCoroutineContext().isActive) {
+                prepareForConnection(host, controlPort, dataPort, hasConnectedOnce)
+                connectionManager.connectWithRetry()
+                hasConnectedOnce = true
 
-            val ctrl = connectionManager.controlChannel ?: run {
-                emitState(TaskState.Error(null, "Control channel unavailable", recoverable = true))
-                return
-            }
+                val ctrl = connectionManager.controlChannel ?: run {
+                    emitState(TaskState.Error(null, "Control channel unavailable", recoverable = true))
+                    return
+                }
 
-            Log.i(TAG, "Control channel ready; waiting control messages")
-            ctrl.incomingMessages.collect { msg ->
-                when (msg) {
-                    is ControlMessage.HelloAck -> handleHelloAck(msg)
-                    is ControlMessage.TaskAssign -> handleTaskAssign(msg)
-                    is ControlMessage.TaskStatusQuery -> handleStatusQuery(msg)
-                    else -> Unit
+                startHeartbeat()
+
+                try {
+                    coroutineScope {
+                        launch {
+                            val disconnect = connectionManager.awaitUnexpectedDisconnect()
+                            throw ConnectionLostException(disconnect)
+                        }
+
+                        Log.i(TAG, "Control channel ready; waiting control messages")
+                        ctrl.incomingMessages.collect { msg ->
+                            when (msg) {
+                                is ControlMessage.HelloAck -> handleHelloAck(msg)
+                                is ControlMessage.TaskAssign -> handleTaskAssign(msg)
+                                is ControlMessage.TaskStatusQuery -> handleStatusQuery(msg)
+                                is ControlMessage.Heartbeat -> handlePeerHeartbeat(msg)
+                                is ControlMessage.Ping -> handlePing(msg)
+                                is ControlMessage.HeartbeatAck,
+                                is ControlMessage.Pong -> Unit
+                                else -> Unit
+                            }
+                        }
+                    }
+                } catch (e: ConnectionLostException) {
+                    Log.w(
+                        TAG,
+                        "Socket disconnected unexpectedly on ${e.disconnect.channel}; reconnecting: ${e.disconnect.reason}",
+                        e.disconnect.cause,
+                    )
+                    heartbeatJob?.cancel()
+                    refreshPendingRecoveryFromCurrentTask()
+                    emitReconnectState(host, controlPort, dataPort, e.disconnect.reason)
+                    runCatching { connectionManager.disconnect() }
+                    continue
                 }
             }
         } finally {
             Log.i(TAG, "Orchestrator stopping; disconnecting socket channels")
+            heartbeatJob?.cancel()
             runCatching { onHelloCurrentTaskChanged(null) }
             orchestratorScope.cancel()
             runCatching { connectionManager.disconnect() }
         }
+    }
+
+    private fun prepareForConnection(host: String, controlPort: Int, dataPort: Int, isReconnect: Boolean) {
+        if (!isReconnect) {
+            if (_taskState.value is TaskState.Idle) {
+                emitState(TaskState.Connecting(host, controlPort, dataPort))
+            }
+            return
+        }
+        when {
+            currentTask == null && _taskState.value is TaskState.Idle -> {
+                emitState(TaskState.Connecting(host, controlPort, dataPort))
+            }
+            currentTask == null && _taskState.value !is TaskState.Connecting -> {
+                emitState(TaskState.Connecting(host, controlPort, dataPort))
+            }
+            currentTask != null && _taskState.value !is TaskState.Error -> {
+                emitState(
+                    TaskState.Error(
+                        taskId = currentTask?.taskId,
+                        reason = "连接中断，正在重新连接服务器",
+                        recoverable = true,
+                    )
+                )
+            }
+        }
+    }
+
+    private fun emitReconnectState(host: String, controlPort: Int, dataPort: Int, reason: String) {
+        if (currentTask == null) {
+            emitState(TaskState.Connecting(host, controlPort, dataPort))
+        } else {
+            emitState(
+                TaskState.Error(
+                    taskId = currentTask?.taskId,
+                    reason = "连接中断，正在重连：$reason",
+                    recoverable = true,
+                )
+            )
+        }
+    }
+
+    private suspend fun refreshPendingRecoveryFromCurrentTask() {
+        recoveryJob?.cancel()
+        recoveryJob = null
+        val taskId = currentTask?.taskId ?: return
+        pendingRecovery = withContext(Dispatchers.IO) { db.taskDao().getById(taskId) }
+            ?.let { buildPendingRecovery(it) }
     }
 
     private suspend fun handleHelloAck(ack: ControlMessage.HelloAck) {
@@ -188,7 +279,7 @@ class TaskOrchestrator(
         val resultExists = fileStore.resultVideoFile(persisted.taskId).exists()
         val assembledExists = fileStore.assembledFile(persisted.taskId).exists()
         val action = when {
-            resultExists -> RecoveryAction.RESUME_UPLOAD
+            persisted.status == "Uploading" && resultExists -> RecoveryAction.RESUME_UPLOAD
             persisted.status == "Processing" && assembledExists -> RecoveryAction.REPROCESS_AND_UPLOAD
             persisted.status == "Receiving" && !persisted.transferId.isNullOrBlank() -> RecoveryAction.RESUME_RECEIVE
             else -> RecoveryAction.WAIT_FOR_SERVER
@@ -479,7 +570,7 @@ class TaskOrchestrator(
         }.onFailure { e ->
             Log.e(TAG, "[$taskId] Upload failed", e)
             emitState(TaskState.Error(taskId, e.message ?: "Upload failed", recoverable = true))
-            dbError(taskId, e.message)
+            dbRecoverableStatus(taskId, "Uploading", e.message)
             return
         }
 
@@ -488,9 +579,7 @@ class TaskOrchestrator(
 
     private suspend fun completeTask(taskId: String) {
         emitState(TaskState.Done(taskId))
-        currentTask = null
-        pendingRecovery = null
-        recoveryJob = null
+        sendTaskStatusReport(taskId)
 
         // ── Success: mark done, clean up local files ──────────────────────
         withContext(Dispatchers.IO) {
@@ -504,6 +593,11 @@ class TaskOrchestrator(
                 Log.w(TAG, "[$taskId] Cleanup failed (non-fatal): ${e.message}")
             }
         }
+
+        currentTask = null
+        pendingRecovery = null
+        recoveryJob = null
+        emitState(TaskState.AwaitingTask)
     }
 
     // ── DB helpers ────────────────────────────────────────────────────────
@@ -517,6 +611,13 @@ class TaskOrchestrator(
     private suspend fun dbError(taskId: String, message: String?) = withContext(Dispatchers.IO) {
         runCatching {
             db.taskDao().updateStatusWithError(taskId, "Error", message, Instant.now().toString())
+        }
+    }
+
+    @SuppressLint("NewApi")
+    private suspend fun dbRecoverableStatus(taskId: String, status: String, message: String?) = withContext(Dispatchers.IO) {
+        runCatching {
+            db.taskDao().updateStatusWithError(taskId, status, message, Instant.now().toString())
         }
     }
 
@@ -574,4 +675,63 @@ class TaskOrchestrator(
     private suspend fun reportProgress(taskId: String) = handleStatusQuery(
         ControlMessage.TaskStatusQuery(requestId = java.util.UUID.randomUUID().toString(), taskId = taskId)
     )
+
+    private suspend fun handlePeerHeartbeat(msg: ControlMessage.Heartbeat) {
+        connectionManager.controlChannel?.send(
+            ControlMessage.HeartbeatAck(
+                requestId = java.util.UUID.randomUUID().toString(),
+                replyToRequestId = msg.requestId,
+                receivedAt = Instant.now().toString(),
+            )
+        )
+    }
+
+    private suspend fun handlePing(msg: ControlMessage.Ping) {
+        connectionManager.controlChannel?.send(
+            ControlMessage.Pong(
+                requestId = java.util.UUID.randomUUID().toString(),
+                replyToRequestId = msg.requestId,
+                sentAt = Instant.now().toString(),
+            )
+        )
+    }
+
+    private fun startHeartbeat() {
+        heartbeatJob?.cancel()
+        heartbeatJob = orchestratorScope.launch {
+            while (isActive) {
+                delay(HEARTBEAT_INTERVAL_MS)
+                runCatching {
+                    connectionManager.controlChannel?.send(
+                        ControlMessage.Heartbeat(
+                            requestId = java.util.UUID.randomUUID().toString(),
+                            sentAt = Instant.now().toString(),
+                        )
+                    )
+                }.onFailure { e ->
+                    Log.w(TAG, "HEARTBEAT send failed: ${e.message}", e)
+                }
+
+                val taskId = currentTask?.taskId
+                if (taskId != null) {
+                    runCatching { sendTaskStatusReport(taskId) }
+                        .onFailure { e -> Log.w(TAG, "Status heartbeat send failed for $taskId: ${e.message}", e) }
+                }
+            }
+        }
+    }
+
+    private suspend fun sendTaskStatusReport(taskId: String) {
+        val snapshot = buildStatusSnapshot(taskId)
+        connectionManager.controlChannel?.send(
+            ControlMessage.TaskStatusReport(
+                requestId = java.util.UUID.randomUUID().toString(),
+                taskId = taskId,
+                status = snapshot.status,
+                progress = snapshot.progress,
+                stage = snapshot.stage,
+                lastError = snapshot.lastError,
+            )
+        )
+    }
 }

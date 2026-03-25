@@ -2,6 +2,9 @@ package osp.leobert.androd.mediaservice.net.socket
 
 import android.util.Log
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 
@@ -18,6 +21,12 @@ class SocketConnectionManager(
     private val controlClientFactory: (String, Int) -> ControlChannelClient,
     private val dataClientFactory: (String, Int) -> DataChannelClient,
 ) {
+
+    data class UnexpectedDisconnect(
+        val channel: String,
+        val reason: String,
+        val cause: Throwable? = null,
+    )
 
     companion object {
         private const val TAG = "SocketConnectionManager"
@@ -81,6 +90,19 @@ class SocketConnectionManager(
         dataChannel = null
         _state.value = ConnectionState.Disconnected
         Log.i(TAG, "disconnect done")
+    }
+
+    suspend fun awaitUnexpectedDisconnect(): UnexpectedDisconnect {
+        val ctrl = controlChannel ?: error("Control channel not connected")
+        val data = dataChannel ?: error("Data channel not connected")
+        return merge(
+            ctrl.disconnectEvents.map {
+                UnexpectedDisconnect(channel = "control", reason = it.reason, cause = it.cause)
+            },
+            data.disconnectEvents.map {
+                UnexpectedDisconnect(channel = "data", reason = it.reason, cause = it.cause)
+            },
+        ).first()
     }
 
     private suspend fun openBothChannels() {
