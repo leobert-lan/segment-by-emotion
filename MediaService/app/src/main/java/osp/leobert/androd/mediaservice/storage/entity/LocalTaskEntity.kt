@@ -18,6 +18,8 @@ data class LocalTaskEntity(
     val fileHash: String,
     /** ProcessingParams serialized as JSON string */
     val processingParamsJson: String,
+    /** Active inbound transferId for chunk resume after reconnect / restart. */
+    val transferId: String? = null,
     /** Mirrors TaskState class name: "Idle","Connecting","Receiving","Processing","Uploading","Done","Error" */
     val status: String,
     val errorMessage: String? = null,

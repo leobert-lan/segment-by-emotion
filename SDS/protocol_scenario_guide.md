@@ -357,6 +357,9 @@ sequenceDiagram
   - `DispatchService._handle_result_chunk()`
   - 校验失败/写盘失败时不 ACK（Node 将超时重试）
   - `DispatchService._handle_result_transfer_complete()` 完成验收
+  - 验收通过后：
+    - 视频文件命名为 `<原始视频名>_cut.<ext>`（例如 `demo.mp4 -> demo_cut.mp4`）
+    - 清理 `chunks/<transferId>/` 临时分片目录
 
 ### 7.4 JSON（结果回传）
 

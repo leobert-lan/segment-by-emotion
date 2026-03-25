@@ -26,6 +26,9 @@ interface TaskDao {
     @Query("UPDATE local_tasks SET status = :status, errorMessage = :error, updatedAt = :updatedAt WHERE taskId = :taskId")
     suspend fun updateStatusWithError(taskId: String, status: String, error: String?, updatedAt: String)
 
+    @Query("UPDATE local_tasks SET transferId = :transferId, updatedAt = :updatedAt WHERE taskId = :taskId")
+    suspend fun updateTransferId(taskId: String, transferId: String, updatedAt: String)
+
     @Query("DELETE FROM local_tasks WHERE taskId = :taskId")
     suspend fun delete(taskId: String)
 }

@@ -1,3 +1,5 @@
+@file:androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+@file:Suppress("UnsafeOptInUsageError")
 package osp.leobert.androd.mediaservice.media.pipeline
 
 import android.content.Context
@@ -33,6 +35,63 @@ import java.io.File
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+internal data class ExportPlan(
+    val videoMimeType: String,
+    val scaleToHeight: Int?,
+    val label: String,
+)
+
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+internal object MediaPipelinePlanner {
+    const val MIN_SEGMENT_DURATION_MS = 250L
+
+    fun normalizeInterestingSegments(
+        segments: List<VideoSegment>,
+        durationMs: Long,
+    ): List<VideoSegment> {
+        val bounded = segments.asSequence()
+            .filter { it.label == VideoSegment.LABEL_INTERESTING }
+            .mapNotNull { segment ->
+                val boundedStart = segment.startMs.coerceAtLeast(0L)
+                val boundedEnd = if (durationMs > 0L) {
+                    segment.endMs.coerceIn(0L, durationMs)
+                } else {
+                    segment.endMs.coerceAtLeast(0L)
+                }
+                if (boundedEnd <= boundedStart) {
+                    null
+                } else {
+                    VideoSegment(
+                        startMs = boundedStart,
+                        endMs = boundedEnd,
+                        label = VideoSegment.LABEL_INTERESTING,
+                    )
+                }
+            }
+            .sortedBy { it.startMs }
+            .toList()
+
+        if (bounded.isEmpty()) return emptyList()
+
+        val merged = mutableListOf<VideoSegment>()
+        bounded.forEach { segment ->
+            val last = merged.lastOrNull()
+            if (last != null && segment.startMs <= last.endMs) {
+                merged[merged.lastIndex] = last.copy(endMs = maxOf(last.endMs, segment.endMs))
+            } else {
+                merged += segment
+            }
+        }
+        return merged.filter { it.durationMs >= MIN_SEGMENT_DURATION_MS }
+    }
+
+    fun preferredVideoMimeType(codecHint: String): String = when (codecHint.lowercase()) {
+        "avc", "h264", MimeTypes.VIDEO_H264 -> MimeTypes.VIDEO_H264
+        else -> MimeTypes.VIDEO_H265
+    }
+}
+
 // videoName is passed in from the task metadata via execute(); kept as a parameter
 // so MediaPipeline stays decoupled from VideoMeta/NodeTask.
 
@@ -42,7 +101,7 @@ import kotlin.coroutines.resumeWithException
  * ## Why a single pass?
  * The legacy SegmentCutter / SegmentMerger used [android.media.MediaExtractor] which does
  * **not** support AVI or FLV containers natively. Media3 Transformer internally uses
- * ExoPlayer's [androidx.media3.exoplayer.DefaultExtractorsFactory] which supports:
+ * Media3's extractor stack supports:
  *   MP4, MKV, WebM, AVI, FLV, MPEG-TS, Ogg, and more.
  *
  * All three stages (clip, concatenate, encode) are handled by a single
@@ -61,6 +120,7 @@ import kotlin.coroutines.resumeWithException
  * Empirical HEVC bitrate per tier, capped at the input file's actual bitrate.
  * See [BitratePolicy] for the table.
  */
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 class MediaPipeline(
     private val context: Context,
     private val fileStore: FileStoreManager,
@@ -90,58 +150,164 @@ class MediaPipeline(
         val inputFile = withContext(Dispatchers.IO) { fileStore.assembledFile(taskId) }
         check(inputFile.exists()) { "Assembled input file not found: ${inputFile.path}" }
 
-        // ── Filter: interesting segments only ─────────────────────────────
-        val interesting = params.segments.filter {
-            it.label == VideoSegment.LABEL_INTERESTING
-        }
-        check(interesting.isNotEmpty()) {
-            "[$taskId] No interesting segments to process " +
-                "(total received: ${params.segments.size})"
-        }
-        Log.i(
-            TAG, "[$taskId] Segments: ${interesting.size} interesting / " +
-                "${params.segments.size - interesting.size} skipped"
-        )
-
         // ── Probe input metadata ──────────────────────────────────────────
         val probe = withContext(Dispatchers.IO) { VideoMetaProber.probe(inputFile) }
-        val targetHeight = ResolutionPolicy.targetHeight(probe.widthPx, probe.heightPx)
-        val targetBitrateKbps = BitratePolicy.computeKbps(
-            targetHeight       = targetHeight,
-            inputBitrateKbps   = probe.bitrateKbps,
-            overrideBitrateKbps = params.targetBitrateKbps,
+        val interesting = MediaPipelinePlanner.normalizeInterestingSegments(
+            segments = params.segments,
+            durationMs = probe.durationMs,
         )
+        check(interesting.isNotEmpty()) {
+            "[$taskId] No valid interesting segments to process " +
+                "(received=${params.segments.size}, minDurationMs=${MediaPipelinePlanner.MIN_SEGMENT_DURATION_MS}, " +
+                "inputDurationMs=${probe.durationMs})"
+        }
+        Log.i(
+            TAG,
+            "[$taskId] Segments after sanitization: ${interesting.size} kept / " +
+                "${params.segments.size - interesting.size} skipped",
+        )
+
+        val targetHeight = ResolutionPolicy.targetHeight(probe.widthPx, probe.heightPx)
         Log.i(
             TAG, "[$taskId] Input ${probe.widthPx}×${probe.heightPx} @${probe.bitrateKbps}kbps" +
-                " → output height=${targetHeight}px @${targetBitrateKbps}kbps"
+                " → preferred output height=${targetHeight}px"
         )
 
         onProgress("transcoding", 0f)
         val resultFile = withContext(Dispatchers.IO) { fileStore.resultVideoFile(taskId) }
 
-        // ── Build Composition ─────────────────────────────────────────────
+        val exportPlans = buildExportPlans(
+            codecHint = params.codecHint,
+            inputHeight = probe.heightPx,
+            targetHeight = targetHeight,
+        )
+
+        var selectedPlan: ExportPlan? = null
+        var selectedBitrateKbps = 0
+        var exportFailure: Throwable? = null
+
+        exportPlans.forEachIndexed { index, plan ->
+            if (selectedPlan != null) return@forEachIndexed
+
+            val outputHeightForBitrate = plan.scaleToHeight ?: probe.heightPx
+            val targetBitrateKbps = BitratePolicy.computeKbps(
+                targetHeight = outputHeightForBitrate,
+                inputBitrateKbps = probe.bitrateKbps,
+                overrideBitrateKbps = params.targetBitrateKbps,
+            )
+
+            runCatching {
+                if (resultFile.exists()) {
+                    resultFile.delete()
+                }
+                runExportAttempt(
+                    taskId = taskId,
+                    inputFile = inputFile,
+                    resultFile = resultFile,
+                    segments = interesting,
+                    plan = plan,
+                    targetBitrateKbps = targetBitrateKbps,
+                    onProgress = onProgress,
+                )
+            }.onSuccess {
+                selectedPlan = plan
+                selectedBitrateKbps = targetBitrateKbps
+            }.onFailure { failure ->
+                exportFailure = failure
+                val canRetry = index < exportPlans.lastIndex && shouldRetryExport(failure)
+                if (!canRetry) {
+                    throw failure
+                }
+                Log.w(
+                    TAG,
+                    "[$taskId] Export attempt '${plan.label}' failed; retrying with a safer fallback",
+                    failure,
+                )
+            }
+        }
+
+        val finalPlan = selectedPlan ?: throw (exportFailure ?: IllegalStateException("[$taskId] Export failed"))
+        val finalTargetHeight = finalPlan.scaleToHeight ?: probe.heightPx
+        val mimeType = finalPlan.videoMimeType
+
+        Log.i(TAG, "[$taskId] Pipeline complete → ${resultFile.path}")
+
+        // ── Write result.json ─────────────────────────────────────────────
+        withContext(Dispatchers.IO) {
+            writeResultJson(
+                taskId           = taskId,
+                videoName        = videoName,
+                params           = params,
+                targetHeightPx   = finalTargetHeight,
+                targetBitrateKbps = selectedBitrateKbps,
+                mimeType         = mimeType,
+                resultVideoFile  = resultFile,
+                outputFile       = fileStore.resultJsonFile(taskId),
+            )
+        }
+
+        return resultFile
+    }
+
+    private fun buildExportPlans(
+        codecHint: String,
+        inputHeight: Int,
+        targetHeight: Int,
+    ): List<ExportPlan> {
+        val preferredMime = MediaPipelinePlanner.preferredVideoMimeType(codecHint)
+        val fallbackMime = if (preferredMime == MimeTypes.VIDEO_H265) MimeTypes.VIDEO_H264 else MimeTypes.VIDEO_H265
+        val availableMimes = listOf(preferredMime, fallbackMime)
+            .distinct()
+            .filter { mimeType -> runCatching { HardwareCodecSelector.selectEncoder(mimeType) }.isSuccess }
+            .ifEmpty { listOf(preferredMime) }
+
+        val scalingHeight = targetHeight.takeIf { it != inputHeight }
+        return buildList {
+            availableMimes.forEach { mimeType ->
+                add(
+                    ExportPlan(
+                        videoMimeType = mimeType,
+                        scaleToHeight = scalingHeight,
+                        label = "mime=$mimeType scale=${scalingHeight ?: inputHeight}",
+                    )
+                )
+            }
+            if (scalingHeight != null) {
+                availableMimes.forEach { mimeType ->
+                    add(
+                        ExportPlan(
+                            videoMimeType = mimeType,
+                            scaleToHeight = null,
+                            label = "mime=$mimeType native=$inputHeight",
+                        )
+                    )
+                }
+            }
+        }.distinctBy { it.videoMimeType to it.scaleToHeight }
+    }
+
+    @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+    private suspend fun runExportAttempt(
+        taskId: String,
+        inputFile: File,
+        resultFile: File,
+        segments: List<VideoSegment>,
+        plan: ExportPlan,
+        targetBitrateKbps: Int,
+        onProgress: (stage: String, progress: Float) -> Unit,
+    ) {
         val inputUri = Uri.fromFile(inputFile)
-
-        val hevcChoice = runCatching {
-            HardwareCodecSelector.selectEncoder(MimeTypes.VIDEO_H265)
-        }.getOrNull()
-        val mimeType = if (hevcChoice != null) MimeTypes.VIDEO_H265 else MimeTypes.VIDEO_H264
-        Log.i(TAG, "[$taskId] Encoder mime=$mimeType hw=${hevcChoice?.isHardware}")
-
-        // Presentation effect scales each clip to targetHeight (aspect ratio preserved).
-        // Skip if input is already at the target height — avoids unnecessary GPU scaling
-        // and may allow Transformer to skip the GL pipeline entirely.
-        val needsScaling = probe.heightPx != targetHeight
-        val videoEffects: List<Effect> = if (needsScaling) {
-            Log.d(TAG, "[$taskId] Scaling ${probe.heightPx}px → ${targetHeight}px (Presentation effect)")
-            listOf(Presentation.createForHeight(targetHeight))
+        val scaleToHeight = plan.scaleToHeight
+        val videoEffects: List<Effect> = if (scaleToHeight != null) {
+            Log.d(TAG, "[$taskId] Scaling enabled → ${scaleToHeight}px for attempt '${plan.label}'")
+            listOf(Presentation.createForHeight(scaleToHeight))
         } else {
-            Log.d(TAG, "[$taskId] No scaling needed (input already at ${targetHeight}px)")
+            Log.d(TAG, "[$taskId] Scaling disabled for attempt '${plan.label}'")
             emptyList()
         }
 
-        val editedMediaItems = interesting.mapIndexed { idx, seg ->
-            Log.d(TAG, "[$taskId] Clip $idx: [${seg.startMs}–${seg.endMs}ms]")
+        val editedMediaItems = segments.mapIndexed { idx, seg ->
+            Log.d(TAG, "[$taskId] Attempt '${plan.label}' clip $idx: [${seg.startMs}–${seg.endMs}ms]")
             EditedMediaItem.Builder(
                 MediaItem.Builder()
                     .setUri(inputUri)
@@ -159,36 +325,20 @@ class MediaPipeline(
 
         val sequenceBuilder = EditedMediaItemSequence.Builder()
         editedMediaItems.forEach { sequenceBuilder.addItem(it) }
-
-        val composition = Composition.Builder(
-            listOf(sequenceBuilder.build())
-        ).build()
+        val composition = Composition.Builder(listOf(sequenceBuilder.build())).build()
 
         val encoderFactory = DefaultEncoderFactory.Builder(context)
             .setRequestedVideoEncoderSettings(
                 VideoEncoderSettings.Builder()
-                    .setBitrate(targetBitrateKbps * 1000) // kbps → bps
+                    .setBitrate(targetBitrateKbps * 1000)
                     .build()
             )
             .build()
 
-        // ── Run Transformer on the main thread ────────────────────────────
-        // Media3 Transformer.start() verifies it is called from the thread that
-        // built the Transformer (applicationLooper). Building on main avoids the
-        // IllegalStateException thrown when called from a looper-less IO thread.
-        //
-        // Audio notes:
-        //   • Audio tracks ARE included (no setRemoveAudio() call).
-        //   • ClippingConfiguration clips audio and video together for each segment.
-        //   • setAudioMimeType(AAC) forces re-encode to AAC, which is required for
-        //     multi-segment PTS concatenation (each segment's audio PTS starts from 0;
-        //     the sequence must stitch them continuously).
-        //   • Without explicit AAC, inputs with AC3/DTS/EAC3 (common in MKV/AVI)
-        //     may hit unsupported-codec paths on some devices.
         withContext(Dispatchers.Main) {
             val transformer = Transformer.Builder(context)
-                .setVideoMimeType(mimeType)
-                .setAudioMimeType(MimeTypes.AUDIO_AAC) // AAC: universally supported; required for multi-segment PTS stitching
+                .setVideoMimeType(plan.videoMimeType)
+                .setAudioMimeType(MimeTypes.AUDIO_AAC)
                 .setEncoderFactory(encoderFactory)
                 .build()
 
@@ -196,13 +346,10 @@ class MediaPipeline(
             val mainHandler = Handler(Looper.getMainLooper())
 
             suspendCancellableCoroutine<Unit> { cont ->
-                // Progress polling — getProgress() must be called on the main thread
                 val pollRunnable = object : Runnable {
                     override fun run() {
                         if (!cont.isActive) return
-                        if (transformer.getProgress(progressHolder) ==
-                            Transformer.PROGRESS_STATE_AVAILABLE
-                        ) {
+                        if (transformer.getProgress(progressHolder) == Transformer.PROGRESS_STATE_AVAILABLE) {
                             onProgress("transcoding", progressHolder.progress / 100f)
                         }
                         mainHandler.postDelayed(this, PROGRESS_POLL_MS)
@@ -217,8 +364,8 @@ class MediaPipeline(
                     ) {
                         mainHandler.removeCallbacks(pollRunnable)
                         Log.i(
-                            TAG, "[$taskId] Transcoding done → ${resultFile.name}" +
-                                " size=${exportResult.fileSizeBytes}B"
+                            TAG,
+                            "[$taskId] Attempt '${plan.label}' done → ${resultFile.name} size=${exportResult.fileSizeBytes}B",
                         )
                         onProgress("transcoding", 1f)
                         cont.resume(Unit)
@@ -230,7 +377,7 @@ class MediaPipeline(
                         exportException: ExportException,
                     ) {
                         mainHandler.removeCallbacks(pollRunnable)
-                        Log.e(TAG, "[$taskId] Transcoding error", exportException)
+                        Log.e(TAG, "[$taskId] Attempt '${plan.label}' failed", exportException)
                         cont.resumeWithException(exportException)
                     }
                 })
@@ -243,23 +390,23 @@ class MediaPipeline(
                 }
             }
         }
+    }
 
-        Log.i(TAG, "[$taskId] Pipeline complete → ${resultFile.path}")
-
-        // ── Write result.json ─────────────────────────────────────────────
-        withContext(Dispatchers.IO) {
-            writeResultJson(
-                taskId           = taskId,
-                videoName        = videoName,
-                params           = params,
-                targetHeightPx   = targetHeight,
-                targetBitrateKbps = targetBitrateKbps,
-                mimeType         = mimeType,
-                resultVideoFile  = resultFile,
-                outputFile       = fileStore.resultJsonFile(taskId),
-            )
+    @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+    private fun shouldRetryExport(error: Throwable): Boolean {
+        var current: Throwable? = error
+        while (current != null) {
+            val message = current.message.orEmpty()
+            if (
+                current is ExportException ||
+                message.contains("Muxer error", ignoreCase = true) ||
+                message.contains("no output sample written", ignoreCase = true) ||
+                message.contains("watchdog", ignoreCase = true)
+            ) {
+                return true
+            }
+            current = current.cause
         }
-
-        return resultFile
+        return false
     }
 }

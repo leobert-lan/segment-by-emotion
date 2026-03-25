@@ -1,8 +1,20 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.ksp)
 }
+
+val localProperties = Properties().apply {
+    val localPropertiesFile = rootProject.file("local.properties")
+    if (localPropertiesFile.exists()) {
+        localPropertiesFile.inputStream().use(::load)
+    }
+}
+
+fun requireLocalProperty(name: String): String =
+    localProperties.getProperty(name) ?: error("Missing `$name` in local.properties")
 
 android {
     namespace = "osp.leobert.androd.mediaservice"
@@ -18,8 +30,18 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    signingConfigs {
+        create("release") {
+            storeFile = rootProject.file(requireLocalProperty("mediaService.signing.storeFile"))
+            storePassword = requireLocalProperty("mediaService.signing.storePassword")
+            keyAlias = requireLocalProperty("mediaService.signing.keyAlias")
+            keyPassword = requireLocalProperty("mediaService.signing.keyPassword")
+        }
+    }
+
     buildTypes {
         release {
+            signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }

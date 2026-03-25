@@ -107,6 +107,11 @@ sequenceDiagram
     N->>DS: RESULT_TRANSFER_COMPLETE(totalHash)
     DS->>FS: ingest + hash校验 + 文件组装
     DS->>GUI: 状态 done
+
+落盘约定（验收通过后）：
+
+- 视频结果文件命名：`<原始视频名>_cut.<ext>`（示例：`demo.mp4 -> demo_cut.mp4`）
+- 上传临时分片目录：`.../chunks/<transferId>/` 会被清理
 ```
 
 ## 6. ACK 超时排障（重点）

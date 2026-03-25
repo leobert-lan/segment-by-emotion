@@ -12,6 +12,9 @@ from src.services.stage3_stub import Stage3PipelineStub
 from src.ui.review_window import ReviewWindow
 
 
+_RUNNING_DISPATCH_STATUSES = {"confirmed", "transferring", "running", "uploading"}
+
+
 class MainWindow(tk.Tk):
     def __init__(
         self,
@@ -51,6 +54,8 @@ class MainWindow(tk.Tk):
         self._batch_import_poll_after_id: str | None = None
 
         self.tasks_tree: ttk.Treeview | None = None
+        self.task_status_filter_var = tk.StringVar(value="全部")
+        self.task_status_filter_combo: ttk.Combobox | None = None
 
         # 节点状态面板组件
         self.nodes_tree: Optional[ttk.Treeview] = None
@@ -97,6 +102,16 @@ class MainWindow(tk.Tk):
         self.batch_import_button = ttk.Button(top, text="批量导入目录", command=self.batch_import_directory)
         self.batch_import_button.grid(row=2, column=2, padx=4)
         ttk.Button(top, text="刷新列表", command=self.refresh_tasks).grid(row=2, column=3, padx=4)
+        ttk.Label(top, text="状态筛选").grid(row=2, column=7, padx=(10, 4), sticky="e")
+        self.task_status_filter_combo = ttk.Combobox(
+            top,
+            textvariable=self.task_status_filter_var,
+            values=["全部"],
+            state="readonly",
+            width=16,
+        )
+        self.task_status_filter_combo.grid(row=2, column=8, padx=4, sticky="w")
+        self.task_status_filter_combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh_tasks())
         ttk.Button(top, text="删除所选任务", command=self.delete_selected_task).grid(row=2, column=4, padx=4)
         ttk.Button(top, text="发送到第三阶段(Stub)", command=self.send_to_stage3).grid(row=2, column=5, padx=4)
         ttk.Button(top, text="下发到节点", command=self.dispatch_to_node).grid(row=2, column=6, padx=4)
@@ -375,13 +390,65 @@ class MainWindow(tk.Tk):
         if self.tasks_tree is None:
             return
         self.tasks_tree.delete(*self.tasks_tree.get_children())
+
+        rows: list[tuple[int, str, str, str, int]] = []
+        display_statuses: set[str] = set()
         for task in self.task_repository.list_tasks():
+            dispatch_status: str | None = None
+            if self.dispatch_service is not None:
+                records = self.dispatch_service.list_dispatch_records(task.id)
+                if records:
+                    dispatch_status = records[0].dispatch_status
+
+            display_status = self._resolve_display_status(task.status, dispatch_status)
+            display_statuses.add(display_status)
             segment_count = self.task_repository.count_segments(task.id)
+            rows.append((task.id, task.video_name, task.speaker_id, display_status, segment_count))
+
+        self._refresh_status_filter_options(display_statuses)
+        selected_filter = self.task_status_filter_var.get().strip() or "全部"
+        for task_id, video_name, speaker_id, display_status, segment_count in rows:
+            if not self._status_filter_match(display_status, selected_filter):
+                continue
             self.tasks_tree.insert(
                 "",
                 "end",
-                values=(task.id, task.video_name, task.speaker_id, task.status, segment_count),
+                values=(task_id, video_name, speaker_id, display_status, segment_count),
             )
+
+    @staticmethod
+    def _resolve_display_status(task_status: str, dispatch_status: str | None) -> str:
+        if dispatch_status == "done":
+            return "completed"
+        if dispatch_status in _RUNNING_DISPATCH_STATUSES:
+            return "running"
+        if dispatch_status in {"failed", "canceled"}:
+            return dispatch_status
+        return task_status
+
+    @staticmethod
+    def _status_filter_match(display_status: str, selected_filter: str) -> bool:
+        if selected_filter in ("", "全部"):
+            return True
+        return display_status == selected_filter
+
+    def _refresh_status_filter_options(self, display_statuses: set[str]) -> None:
+        if self.task_status_filter_combo is None:
+            return
+        preserved = self.task_status_filter_var.get().strip() or "全部"
+        options = ["全部"] + self._ordered_statuses(display_statuses)
+        self.task_status_filter_combo["values"] = options
+        if preserved in options:
+            self.task_status_filter_var.set(preserved)
+        else:
+            self.task_status_filter_var.set("全部")
+
+    @staticmethod
+    def _ordered_statuses(statuses: set[str]) -> list[str]:
+        preferred = ["running", "completed"]
+        ordered = [s for s in preferred if s in statuses]
+        ordered.extend(sorted(s for s in statuses if s not in preferred))
+        return ordered
 
     def selected_task_id(self) -> int | None:
         if self.tasks_tree is None:

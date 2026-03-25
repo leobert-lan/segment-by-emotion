@@ -788,6 +788,8 @@ class DispatchService:
             logger.warning("结果完成但无活跃分发记录: task=%d node=%s", task_id, node_id)
             return
 
+        task = self._task_repo.get_task(task_id)
+
         self._dispatch_repo.update_dispatch_status(record.id, "uploading")
 
         loop = asyncio.get_running_loop()
@@ -801,6 +803,7 @@ class DispatchService:
                 chunks_base,
                 out_dir,
                 msg.totalHash,
+                task.video_name,
             )
             self._dispatch_repo.update_dispatch_status(record.id, "done")
             self._dispatch_repo.update_node_status(node_id, "online", None)

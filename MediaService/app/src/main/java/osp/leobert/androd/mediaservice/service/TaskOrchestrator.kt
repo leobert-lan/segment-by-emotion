@@ -61,6 +61,7 @@ class TaskOrchestrator(
     private var recoveryJob: Job? = null
 
     private enum class RecoveryAction {
+        RESUME_RECEIVE,
         RESUME_UPLOAD,
         REPROCESS_AND_UPLOAD,
         WAIT_FOR_SERVER,
@@ -71,6 +72,7 @@ class TaskOrchestrator(
         val persistedStatus: String,
         val initialState: TaskState,
         val action: RecoveryAction,
+        val transferId: String?,
     )
 
     private data class StatusSnapshot(
@@ -188,6 +190,7 @@ class TaskOrchestrator(
         val action = when {
             resultExists -> RecoveryAction.RESUME_UPLOAD
             persisted.status == "Processing" && assembledExists -> RecoveryAction.REPROCESS_AND_UPLOAD
+            persisted.status == "Receiving" && !persisted.transferId.isNullOrBlank() -> RecoveryAction.RESUME_RECEIVE
             else -> RecoveryAction.WAIT_FOR_SERVER
         }
         val initialState = when (persisted.status) {
@@ -215,6 +218,7 @@ class TaskOrchestrator(
             persistedStatus = persisted.status,
             initialState = initialState,
             action = action,
+            transferId = persisted.transferId,
         )
     }
 
@@ -259,6 +263,7 @@ class TaskOrchestrator(
         pendingRecovery = recovery
         recoveryJob = orchestratorScope.launch {
             when (recovery.action) {
+                RecoveryAction.RESUME_RECEIVE -> resumeRecoveredReceive(recovery)
                 RecoveryAction.RESUME_UPLOAD -> resumeRecoveredUpload(recovery.task.taskId)
                 RecoveryAction.REPROCESS_AND_UPLOAD -> runProcessingAndUpload(
                     recovery.task.taskId,
@@ -332,7 +337,6 @@ class TaskOrchestrator(
             return
         }
 
-        var maxChunkIndex = -1
         while (true) {
             val event = dataEvents.first { msg ->
                 when (msg) {
@@ -343,12 +347,8 @@ class TaskOrchestrator(
             }
             when (event) {
                 is DataMessage.Chunk -> {
-                    if (event.chunkIndex > maxChunkIndex) {
-                        maxChunkIndex = event.chunkIndex
-                        val progress = ((maxChunkIndex + 1).toFloat() / meta.totalChunks)
-                            .coerceIn(0f, 0.999f)
-                        emitState(TaskState.Receiving(taskId, meta.videoName, progress))
-                    }
+                    val progress = receivedProgressOf(taskId, meta.totalChunks)
+                    emitState(TaskState.Receiving(taskId, meta.videoName, progress))
                 }
                 is DataMessage.TransferComplete -> {
                     Log.i(TAG, "[$taskId] Transfer complete received, starting assemble")
@@ -358,6 +358,14 @@ class TaskOrchestrator(
             }
         }
 
+        finishTransferAndProcess(taskId, meta, params)
+    }
+
+    private suspend fun finishTransferAndProcess(
+        taskId: String,
+        meta: VideoMeta,
+        params: ProcessingParams,
+    ) {
         val assembled = runCatching {
             withContext(Dispatchers.IO) {
                 fileStore.assembleFile(taskId, meta.totalChunks)
@@ -374,6 +382,44 @@ class TaskOrchestrator(
             return
         }
         runProcessingAndUpload(taskId, params)
+    }
+
+    private suspend fun resumeRecoveredReceive(recovery: PendingRecovery) {
+        val task = recovery.task
+        val taskId = task.taskId
+        val transferId = recovery.transferId
+        if (transferId.isNullOrBlank()) {
+            emitState(TaskState.Error(taskId, "Missing transferId for receive recovery", recoverable = true))
+            return
+        }
+
+        val missingIndices = missingChunkIndices(taskId, task.videoMeta.totalChunks)
+        val receivedProgress = receivedProgressOf(taskId, task.videoMeta.totalChunks)
+        emitState(TaskState.Receiving(taskId, task.videoMeta.videoName, receivedProgress))
+
+        if (missingIndices.isEmpty()) {
+            Log.i(TAG, "[$taskId] All chunks already present on recovery; continuing with assembly")
+            finishTransferAndProcess(taskId, task.videoMeta, task.processingParams)
+            return
+        }
+
+        val dataChannel = connectionManager.dataChannel ?: run {
+            emitState(TaskState.Error(taskId, "Data channel unavailable", recoverable = true))
+            return
+        }
+
+        Log.i(
+            TAG,
+            "[$taskId] Requesting missing chunks after recovery: ${missingIndices.size} pending, transferId=$transferId",
+        )
+        dataChannel.writeDataFrame(
+            DataMessage.TransferResumeRequest(
+                taskId = taskId,
+                transferId = transferId,
+                missingIndices = missingIndices,
+            )
+        )
+        awaitTransferAndProcess(taskId, task.videoMeta, task.processingParams)
     }
 
     @SuppressLint("NewApi")
@@ -414,6 +460,11 @@ class TaskOrchestrator(
             return
         }
         uploadResult(taskId, resultFile)
+    }
+
+    private fun missingChunkIndices(taskId: String, totalChunks: Int): List<Int> {
+        if (totalChunks <= 0) return emptyList()
+        return (0 until totalChunks).filterNot { index -> fileStore.chunkFile(taskId, index).exists() }
     }
 
     private suspend fun uploadResult(taskId: String, resultFile: File) {

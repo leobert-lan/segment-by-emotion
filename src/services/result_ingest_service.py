@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import shutil
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,7 @@ class ResultIngestService:
         chunks_base: Path,
         out_dir: Path,
         total_hash: str,
+        source_video_name: str | None = None,
     ) -> None:
         """
         组装各 fileRole 分片文件，校验视频 hash，写入最终目录。
@@ -34,6 +36,7 @@ class ResultIngestService:
         :param chunks_base:         chunks 根目录 .../chunks/<transferId>/
         :param out_dir:             最终落盘目录 .../node_results/<taskId>/<nodeId>/
         :param total_hash:          ResultTransferComplete.totalHash（视频文件 SHA-256）
+        :param source_video_name:   原始视频文件名（用于生成 *_cut 命名）
         :raises ValueError:         hash 不匹配或必要文件缺失
         """
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -49,7 +52,9 @@ class ResultIngestService:
             if not role_dir.is_dir():
                 continue
             file_role = role_dir.name
-            out_path = self._assemble_chunks(role_dir, out_dir, file_role)
+            out_path = self._assemble_chunks(
+                role_dir, out_dir, file_role, source_video_name
+            )
             assembled[file_role] = out_path
             logger.info(
                 "结果文件组装完成: task=%d role=%s size=%d B",
@@ -81,16 +86,25 @@ class ResultIngestService:
             out_dir,
             node_id,
         )
+        # 结果已验收完成，清理回传分片临时目录，避免长期占用磁盘。
+        shutil.rmtree(chunks_base, ignore_errors=True)
 
     # ── 内部 ──────────────────────────────────────────────────────────────────
 
     def _assemble_chunks(
-        self, role_dir: Path, out_dir: Path, file_role: str
+        self,
+        role_dir: Path,
+        out_dir: Path,
+        file_role: str,
+        source_video_name: str | None,
     ) -> Path:
         """按 chunk_index 升序拼接所有 .bin 分片，返回输出文件路径。"""
         ext_map = {"video": ".mp4", "json": ".json", "log": ".log"}
-        ext = ext_map.get(file_role, f".{file_role}")
-        out_path = out_dir / f"result{ext}"
+        if file_role == "video":
+            out_path = out_dir / _build_cut_video_name(source_video_name)
+        else:
+            ext = ext_map.get(file_role, f".{file_role}")
+            out_path = out_dir / f"result{ext}"
 
         chunk_files = sorted(
             role_dir.glob("*.bin"),
@@ -132,4 +146,13 @@ def _sha256_file(path: Path) -> str:
                 break
             h.update(buf)
     return h.hexdigest()
+
+
+def _build_cut_video_name(source_video_name: str | None) -> str:
+    if not source_video_name:
+        return "result_cut.mp4"
+    p = Path(source_video_name)
+    ext = p.suffix or ".mp4"
+    return f"{p.stem}_cut{ext}"
+
 

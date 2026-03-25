@@ -21,6 +21,7 @@ import osp.leobert.androd.mediaservice.net.socket.SocketConnectionManager
 import osp.leobert.androd.mediaservice.storage.db.AppDatabase
 import osp.leobert.androd.mediaservice.storage.file.FileStoreManager
 import osp.leobert.androd.mediaservice.storage.prefs.NodePreferences
+import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicReference
 
@@ -37,6 +38,12 @@ import java.util.concurrent.atomic.AtomicReference
  */
 class MediaNodeService : LifecycleService() {
 
+    private data class ConnectionConfig(
+        val host: String,
+        val controlPort: Int,
+        val dataPort: Int,
+    )
+
     companion object {
         const val ACTION_CONNECT = "osp.leobert.mediaservice.ACTION_CONNECT"
         const val ACTION_DISCONNECT = "osp.leobert.mediaservice.ACTION_DISCONNECT"
@@ -50,6 +57,7 @@ class MediaNodeService : LifecycleService() {
 
     private var orchestratorJob: Job? = null
     private lateinit var notificationManager: NotificationManager
+    private var activeConnectionConfig: ConnectionConfig? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -67,14 +75,19 @@ class MediaNodeService : LifecycleService() {
     }
 
     private fun handleConnect(intent: Intent) {
+        val host = intent.getStringExtra(EXTRA_HOST) ?: return
+        val controlPort = intent.getIntExtra(EXTRA_CONTROL_PORT, NodePreferences.DEFAULT_CONTROL_PORT)
+        val dataPort = intent.getIntExtra(EXTRA_DATA_PORT, NodePreferences.DEFAULT_DATA_PORT)
+        val requestedConfig = ConnectionConfig(host, controlPort, dataPort)
+
+        if (orchestratorJob?.isActive == true && activeConnectionConfig == requestedConfig) {
+            return
+        }
         if (orchestratorJob?.isActive == true) {
             orchestratorJob?.cancel()
             orchestratorJob = null
         }
-
-        val host = intent.getStringExtra(EXTRA_HOST) ?: return
-        val controlPort = intent.getIntExtra(EXTRA_CONTROL_PORT, NodePreferences.DEFAULT_CONTROL_PORT)
-        val dataPort = intent.getIntExtra(EXTRA_DATA_PORT, NodePreferences.DEFAULT_DATA_PORT)
+        activeConnectionConfig = requestedConfig
 
         startForeground(NOTIFICATION_ID, buildNotification(TaskState.Connecting(host, controlPort, dataPort)))
 
@@ -108,6 +121,11 @@ class MediaNodeService : LifecycleService() {
                     onChunkReceived = { chunk, payload ->
                         fileStore.writeChunkPayload(chunk.taskId, chunk.chunkIndex, payload)
                         db.chunkDao().markReceived(chunk.taskId, chunk.chunkIndex)
+                        db.taskDao().updateTransferId(
+                            taskId = chunk.taskId,
+                            transferId = chunk.transferId,
+                            updatedAt = Instant.now().toString(),
+                        )
                         true
                     },
                     onTransferComplete = { /* handled in DataChannelClient dataEvents */ },
@@ -137,6 +155,7 @@ class MediaNodeService : LifecycleService() {
     private fun handleDisconnect() {
         orchestratorJob?.cancel()
         orchestratorJob = null
+        activeConnectionConfig = null
         NodeStateHolder.update(TaskState.Idle)
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
