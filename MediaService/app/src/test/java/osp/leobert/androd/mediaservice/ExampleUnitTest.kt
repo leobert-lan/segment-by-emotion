@@ -64,4 +64,24 @@ class ExampleUnitTest {
         assertTrue(ping is ControlMessage.Ping)
         assertTrue(pong is ControlMessage.Pong)
     }
+
+    @Test
+    fun taskFailureProtocol_roundTripsExpectedTypes() {
+        val encoded = MessageFramer.encodeControl(
+            ControlMessage.TaskFailureReport(
+                requestId = "fail-1",
+                taskId = "task-42",
+                failedStage = "PROCESSING",
+                reason = "encoder stalled",
+                sentAt = "2026-03-26T10:00:00Z",
+            )
+        )
+        val decodedAck = MessageFramer.decodeControl(
+            """{"requestId":"ack-42","type":"TASK_FAILURE_ACK","taskId":"task-42","accepted":true,"message":"queued next task"}"""
+        )
+
+        assertTrue(encoded.contains("\"type\":\"TASK_FAILURE_REPORT\""))
+        assertTrue(encoded.contains("\"taskId\":\"task-42\""))
+        assertTrue(decodedAck is ControlMessage.TaskFailureAck)
+    }
 }

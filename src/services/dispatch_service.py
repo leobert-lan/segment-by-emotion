@@ -61,6 +61,13 @@ _STATUS_STAGE_ORDER: dict[str, int] = {
     "canceled": 6,
 }
 
+# 允许的“恢复型回退”：节点重连后可能先回到接收阶段再继续处理。
+_ALLOWED_STATUS_ROLLBACKS: set[tuple[str, str]] = {
+    ("running", "transferring"),
+    ("uploading", "running"),
+    ("uploading", "transferring"),
+}
+
 
 def _protocol_log(event: str, current: str, next_step: str, **fields: object) -> None:
     """Structured protocol logs for tracking step progression and next action."""
@@ -437,13 +444,22 @@ class DispatchService:
             cur_stage = _STATUS_STAGE_ORDER.get(record.dispatch_status, -1)
             next_stage = _STATUS_STAGE_ORDER.get(new_status, -1)
             if next_stage < cur_stage:
-                logger.warning(
-                    "忽略状态回退: task=%d current=%s reported=%s",
-                    task_id,
-                    record.dispatch_status,
-                    msg.status,
-                )
-                return
+                if (record.dispatch_status, new_status) in _ALLOWED_STATUS_ROLLBACKS:
+                    logger.warning(
+                        "允许恢复型回退: task=%d current=%s reported=%s mapped=%s",
+                        task_id,
+                        record.dispatch_status,
+                        msg.status,
+                        new_status,
+                    )
+                else:
+                    logger.warning(
+                        "忽略状态回退: task=%d current=%s reported=%s",
+                        task_id,
+                        record.dispatch_status,
+                        msg.status,
+                    )
+                    return
             self._dispatch_repo.update_dispatch_status(
                 record.id, new_status, msg.lastError
             )
@@ -856,6 +872,9 @@ class DispatchService:
         if session is None:
             return
 
+        preferred_tasks: list[int] = []
+        fallback_failed_tasks: list[int] = []
+
         for task in self._task_repo.list_tasks():
             if task.status != "review_done":
                 continue
@@ -863,18 +882,27 @@ class DispatchService:
                 continue
 
             records = self._dispatch_repo.list_records_for_task(task.id)
-            if records:
-                # 自动续派只消费未下发过的 review_done 任务，失败/重试留给人工确认。
+            if any(r.dispatch_status in ("assigned", "confirmed", "transferring", "running", "uploading") for r in records):
                 continue
 
+            if any(r.dispatch_status == "done" for r in records):
+                continue
+
+            if any(r.dispatch_status == "failed" for r in records):
+                fallback_failed_tasks.append(task.id)
+                continue
+
+            preferred_tasks.append(task.id)
+
+        for candidate_task_id in preferred_tasks + fallback_failed_tasks:
             try:
-                await self.dispatch_task(task.id, node_id)
-                logger.info("自动续派成功: task=%d node=%s", task.id, node_id)
+                await self.dispatch_task(candidate_task_id, node_id)
+                logger.info("自动续派成功: task=%d node=%s", candidate_task_id, node_id)
                 return
             except Exception as exc:
                 logger.warning(
                     "自动续派失败，继续扫描下一任务: task=%d node=%s err=%s",
-                    task.id,
+                    candidate_task_id,
                     node_id,
                     exc,
                 )

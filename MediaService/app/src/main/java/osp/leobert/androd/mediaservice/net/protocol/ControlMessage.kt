@@ -140,6 +140,29 @@ sealed class ControlMessage {
         val reason: String? = null,
     ) : ControlMessage()
 
+    /**
+     * Sent when the node determines the current task has failed permanently and should be
+     * released back to the server-side scheduler.
+     */
+    data class TaskFailureReport(
+        @SerializedName("requestId")
+        override val requestId: String,
+        @SerializedName("type")
+        override val type: String = "TASK_FAILURE_REPORT",
+        @SerializedName("taskId")
+        val taskId: String,
+        @SerializedName("failedStage")
+        val failedStage: String,
+        @SerializedName("reason")
+        val reason: String,
+        @SerializedName("terminal")
+        val terminal: Boolean = true,
+        @SerializedName("readyForNextTask")
+        val readyForNextTask: Boolean = true,
+        @SerializedName("sentAt")
+        val sentAt: String,
+    ) : ControlMessage()
+
     // ── Server → Node ──────────────────────────────────────────────────────
 
     data class HelloAck(
@@ -220,6 +243,23 @@ sealed class ControlMessage {
         override val type: String = "TASK_STATUS_QUERY",
         @SerializedName("taskId")
         val taskId: String,
+    ) : ControlMessage()
+
+    /**
+     * Optional acknowledgement for [TaskFailureReport]. Android currently treats it as
+     * informational only and becomes immediately available for the next task after reporting.
+     */
+    data class TaskFailureAck(
+        @SerializedName("requestId")
+        override val requestId: String,
+        @SerializedName("type")
+        override val type: String = "TASK_FAILURE_ACK",
+        @SerializedName("taskId")
+        val taskId: String,
+        @SerializedName("accepted")
+        val accepted: Boolean = true,
+        @SerializedName("message")
+        val message: String? = null,
     ) : ControlMessage()
 }
 

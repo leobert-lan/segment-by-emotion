@@ -187,6 +187,7 @@ class SocketServer:
 
         session = NodeSession(peer_ip)
         session.set_control(reader, writer)
+        asyncio.create_task(self._watch_channel_closed(session, writer, "control"))
 
         # 检查数据通道是否已先到达
         if peer_ip in self._pending_data:
@@ -195,6 +196,7 @@ class SocketServer:
             if evt:
                 evt.set()
             session.set_data(dr, dw)
+            asyncio.create_task(self._watch_channel_closed(session, dw, "data"))
             logger.debug("控制通道后配对 data: %s", peer_ip)
             _protocol_log(
                 "pair_ready_data_first",
@@ -346,6 +348,7 @@ class SocketServer:
         if peer_ip in self._pending_ctrl:
             session = self._pending_ctrl.pop(peer_ip)
             session.set_data(reader, writer)
+            asyncio.create_task(self._watch_channel_closed(session, writer, "data"))
             # 触发配对事件
             if peer_ip in self._pair_events:
                 self._pair_events[peer_ip].set()
@@ -458,6 +461,19 @@ class SocketServer:
                     timeout_sec=_HEARTBEAT_TIMEOUT,
                 )
                 await self._handle_session_disconnect(session, reason="heartbeat_timeout")
+
+    async def _watch_channel_closed(
+        self,
+        session: NodeSession,
+        writer: asyncio.StreamWriter,
+        channel: str,
+    ) -> None:
+        """监视底层 socket 关闭事件，尽量在 read loop 之前即时感知断链。"""
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        await self._handle_session_disconnect(session, reason=f"{channel}_channel_closed")
 
     # ── 内部 async 发送 ───────────────────────────────────────────────────────
 

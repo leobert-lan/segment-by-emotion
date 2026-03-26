@@ -77,9 +77,11 @@ object MessageFramer {
             "PONG" -> gson.fromJson(json, ControlMessage.Pong::class.java)
             "TASK_STATUS_REPORT" -> gson.fromJson(json, ControlMessage.TaskStatusReport::class.java)
             "TASK_CONFIRM" -> gson.fromJson(json, ControlMessage.TaskConfirm::class.java)
+            "TASK_FAILURE_REPORT" -> gson.fromJson(json, ControlMessage.TaskFailureReport::class.java)
             "HELLO_ACK" -> gson.fromJson(json, ControlMessage.HelloAck::class.java)
             "TASK_ASSIGN" -> gson.fromJson(json, ControlMessage.TaskAssign::class.java)
             "TASK_STATUS_QUERY" -> gson.fromJson(json, ControlMessage.TaskStatusQuery::class.java)
+            "TASK_FAILURE_ACK" -> gson.fromJson(json, ControlMessage.TaskFailureAck::class.java)
             else -> throw IllegalArgumentException("Unknown control message type=${json.getRequiredString("type")}")
         }
     }

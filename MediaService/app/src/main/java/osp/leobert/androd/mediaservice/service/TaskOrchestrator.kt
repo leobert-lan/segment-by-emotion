@@ -54,6 +54,9 @@ class TaskOrchestrator(
     companion object {
         private const val TAG = "TaskOrchestrator"
         private const val HEARTBEAT_INTERVAL_MS = 15_000L
+        private const val FAILURE_STAGE_RECEIVING = "RECEIVING"
+        private const val FAILURE_STAGE_PROCESSING = "PROCESSING"
+        private const val FAILURE_STAGE_UPLOADING = "UPLOADING"
     }
 
     private val gson = Gson()
@@ -157,6 +160,7 @@ class TaskOrchestrator(
                                 is ControlMessage.Heartbeat -> handlePeerHeartbeat(msg)
                                 is ControlMessage.Ping -> handlePing(msg)
                                 is ControlMessage.HeartbeatAck,
+                                is ControlMessage.TaskFailureAck,
                                 is ControlMessage.Pong -> Unit
                                 else -> Unit
                             }
@@ -462,14 +466,20 @@ class TaskOrchestrator(
                 fileStore.assembleFile(taskId, meta.totalChunks)
             }
         }.getOrElse { e ->
-            emitState(TaskState.Error(taskId, e.message ?: "Assembly failed", recoverable = false))
-            dbError(taskId, e.message)
+            failTaskAndAwaitNext(
+                taskId = taskId,
+                failedStage = FAILURE_STAGE_RECEIVING,
+                reason = e.message ?: "Assembly failed",
+            )
             return
         }
         val hash = withContext(Dispatchers.IO) { fileStore.sha256Hex(assembled) }
         if (hash != meta.fileHash) {
-            emitState(TaskState.Error(taskId, "File hash mismatch", recoverable = false))
-            dbError(taskId, "hash mismatch: expected ${meta.fileHash} got $hash")
+            failTaskAndAwaitNext(
+                taskId = taskId,
+                failedStage = FAILURE_STAGE_RECEIVING,
+                reason = "hash mismatch: expected ${meta.fileHash} got $hash",
+            )
             return
         }
         runProcessingAndUpload(taskId, params)
@@ -480,7 +490,11 @@ class TaskOrchestrator(
         val taskId = task.taskId
         val transferId = recovery.transferId
         if (transferId.isNullOrBlank()) {
-            emitState(TaskState.Error(taskId, "Missing transferId for receive recovery", recoverable = true))
+            failTaskAndAwaitNext(
+                taskId = taskId,
+                failedStage = FAILURE_STAGE_RECEIVING,
+                reason = "Missing transferId for receive recovery",
+            )
             return
         }
 
@@ -534,8 +548,11 @@ class TaskOrchestrator(
             }
         }.getOrElse { e ->
             Log.e(TAG, "[$taskId] Pipeline failed", e)
-            emitState(TaskState.Error(taskId, e.message ?: "Pipeline failed", recoverable = false))
-            dbError(taskId, e.message)
+            failTaskAndAwaitNext(
+                taskId = taskId,
+                failedStage = FAILURE_STAGE_PROCESSING,
+                reason = e.message ?: "Pipeline failed",
+            )
             return
         }
 
@@ -545,9 +562,11 @@ class TaskOrchestrator(
     private suspend fun resumeRecoveredUpload(taskId: String) {
         val resultFile = fileStore.resultVideoFile(taskId)
         if (!resultFile.exists()) {
-            val message = "Result file missing for resume upload"
-            emitState(TaskState.Error(taskId, message, recoverable = false))
-            dbError(taskId, message)
+            failTaskAndAwaitNext(
+                taskId = taskId,
+                failedStage = FAILURE_STAGE_UPLOADING,
+                reason = "Result file missing for resume upload",
+            )
             return
         }
         uploadResult(taskId, resultFile)
@@ -619,6 +638,48 @@ class TaskOrchestrator(
         runCatching {
             db.taskDao().updateStatusWithError(taskId, status, message, Instant.now().toString())
         }
+    }
+
+    @SuppressLint("NewApi")
+    private suspend fun failTaskAndAwaitNext(
+        taskId: String,
+        failedStage: String,
+        reason: String,
+    ) {
+        Log.e(TAG, "[$taskId] Terminal task failure stage=$failedStage reason=$reason")
+        emitState(TaskState.Error(taskId, reason, recoverable = false))
+        dbError(taskId, reason)
+
+        runCatching {
+            connectionManager.controlChannel?.send(
+                ControlMessage.TaskFailureReport(
+                    requestId = java.util.UUID.randomUUID().toString(),
+                    taskId = taskId,
+                    failedStage = failedStage,
+                    reason = reason,
+                    sentAt = Instant.now().toString(),
+                )
+            )
+        }.onFailure { e ->
+            Log.w(TAG, "[$taskId] Failed to notify server about terminal task failure: ${e.message}", e)
+        }
+
+        withContext(Dispatchers.IO) {
+            runCatching {
+                db.taskDao().delete(taskId)
+                fileStore.cleanTask(taskId)
+            }.onFailure { e ->
+                Log.w(TAG, "[$taskId] Failed task cleanup failed (non-fatal): ${e.message}", e)
+            }
+        }
+
+        if (currentTask?.taskId == taskId) {
+            currentTask = null
+        }
+        pendingRecovery = null
+        recoveryJob?.cancel()
+        recoveryJob = null
+        emitState(TaskState.AwaitingTask)
     }
 
     private suspend fun handleStatusQuery(msg: ControlMessage.TaskStatusQuery) {

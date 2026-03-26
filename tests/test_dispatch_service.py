@@ -18,6 +18,7 @@ from src.services.heat_service import HeatAnalyzer
 from src.services.ingest_service import TaskIngestService
 from src.services.result_ingest_service import ResultIngestService
 from src.net.protocol.control_message import MsgTaskConfirm
+from src.net.protocol.control_message import MsgTaskStatusReport
 from src.net.protocol.data_message import (
     MsgChunkAck,
     MsgTransferResumeRequest,
@@ -291,6 +292,82 @@ class TestDispatchService(unittest.IsolatedAsyncioTestCase):
         await self.svc._handle_result_chunk(self.session, msg, payload)
         self.assertEqual(len(acks_sent), 1)
         self.assertEqual(acks_sent[0]["chunkIndex"], 0)
+
+    async def test_status_report_allows_recovery_rollback_running_to_transferring(self) -> None:
+        record = self.dispatch_repo.create_dispatch_record(self.task.id, self.session.node_id or "")
+        self.dispatch_repo.update_dispatch_status(record.id, "running")
+
+        msg = MsgTaskStatusReport(
+            requestId="req-status-1",
+            taskId=str(self.task.id),
+            status="Receiving",
+            progress=0.2,
+        )
+        await self.svc._handle_status_report(self.session, msg)
+
+        latest = self.dispatch_repo.get_dispatch_record(record.id)
+        self.assertIsNotNone(latest)
+        self.assertEqual(latest.dispatch_status, "transferring")  # type: ignore[union-attr]
+
+    async def test_status_report_rejects_invalid_rollback_running_to_confirmed(self) -> None:
+        record = self.dispatch_repo.create_dispatch_record(self.task.id, self.session.node_id or "")
+        self.dispatch_repo.update_dispatch_status(record.id, "running")
+
+        msg = MsgTaskStatusReport(
+            requestId="req-status-2",
+            taskId=str(self.task.id),
+            status="AwaitingTask",
+            progress=0.0,
+        )
+        await self.svc._handle_status_report(self.session, msg)
+
+        latest = self.dispatch_repo.get_dispatch_record(record.id)
+        self.assertIsNotNone(latest)
+        self.assertEqual(latest.dispatch_status, "running")  # type: ignore[union-attr]
+
+    async def test_auto_dispatch_prefers_non_failed_tasks(self) -> None:
+        # 创建一个失败历史任务（更高 id，若无优先级逻辑会先被选中）
+        preferred = self.task_repo.create_task(str(self.video_path), "spk-001", 2.0)
+        self.task_repo.update_task_status(preferred.id, "review_done")
+
+        failed_first = self.task_repo.create_task(str(self.video_path), "spk-001", 2.0)
+        self.task_repo.update_task_status(failed_first.id, "review_done")
+        failed_record = self.dispatch_repo.create_dispatch_record(
+            failed_first.id, self.session.node_id or ""
+        )
+        self.dispatch_repo.update_dispatch_status(failed_record.id, "failed", "mock fail")
+
+        picked: list[int] = []
+
+        async def fake_dispatch(task_id: int, node_id: str) -> None:
+            picked.append(task_id)
+
+        self.svc.dispatch_task = fake_dispatch  # type: ignore[assignment]
+        await self.svc._auto_dispatch_next_review_done(
+            self.session.node_id or "", just_finished_task_id=self.task.id
+        )
+
+        self.assertEqual(picked, [preferred.id])
+
+    async def test_auto_dispatch_uses_failed_task_when_no_clean_task(self) -> None:
+        failed_only = self.task_repo.create_task(str(self.video_path), "spk-001", 2.0)
+        self.task_repo.update_task_status(failed_only.id, "review_done")
+        failed_record = self.dispatch_repo.create_dispatch_record(
+            failed_only.id, self.session.node_id or ""
+        )
+        self.dispatch_repo.update_dispatch_status(failed_record.id, "failed", "mock fail")
+
+        picked: list[int] = []
+
+        async def fake_dispatch(task_id: int, node_id: str) -> None:
+            picked.append(task_id)
+
+        self.svc.dispatch_task = fake_dispatch  # type: ignore[assignment]
+        await self.svc._auto_dispatch_next_review_done(
+            self.session.node_id or "", just_finished_task_id=self.task.id
+        )
+
+        self.assertEqual(picked, [failed_only.id])
 
 
 if __name__ == "__main__":
