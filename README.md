@@ -1,4 +1,4 @@
-# SegmentByMotion (MVP)
+# SegmentByEmotion
 
 Python GUI MVP for emotion-highlight review workflow:
 - Stage 1: create task from video path and compute heat segments (real audio features via `librosa` when decodable)
